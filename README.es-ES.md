@@ -4,6 +4,7 @@ Herramienta de recolección y análisis de rendimiento del cliente, compatible c
 
 - Documentación china: [README.md](README.md)
 - English documentation: [README.en.md](README.en.md)
+- Versión actual: `5.1.0` | [Notas de la versión](CHANGELOG.md)
 
 ---
 
