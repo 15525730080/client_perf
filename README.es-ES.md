@@ -2,6 +2,9 @@
 
 Herramienta de recolección y análisis de rendimiento del cliente, compatible con las cuatro grandes plataformas: **PC / Android / iOS / HarmonyOS**. Ofrece capacidades de recolección de métricas de rendimiento multidimensionales, gestión de tareas, comparación de datos y análisis visual.
 
+- Documentación china: [README.md](README.md)
+- English documentation: [README.en.md](README.en.md)
+
 ---
 
 ## Capturas de Pantalla / Screenshots
