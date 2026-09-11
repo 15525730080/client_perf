@@ -4,6 +4,10 @@
 
 A client performance collection and analysis tool supporting **PC / Android / iOS / HarmonyOS** platforms, providing multi-dimensional performance metrics collection, task management, data comparison and visual analysis capabilities.
 
+- English documentation: [README.en.md](README.en.md)
+- Documentación en español: [README.es-ES.md](README.es-ES.md)
+- Current release: `5.1.0` | [Release notes](CHANGELOG.md)
+
 ---
 
 ## 实例截图 / Screenshots

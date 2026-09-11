@@ -4,6 +4,7 @@
 
 - Chinese documentation: [README.md](README.md)
 - Spanish documentation: [README.es-ES.md](README.es-ES.md)
+- Current release: `5.1.0` | [Release notes](CHANGELOG.md)
 
 ## Features
 
