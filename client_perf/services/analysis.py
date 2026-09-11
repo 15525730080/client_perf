@@ -370,7 +370,7 @@ async def advanced_compare(
             "base_mean": round(bm, 4),
             "compare_mean": round(cm, 4),
             "diff": round(diff, 4),
-            "percent_change": round(pct, 2),
+            "percent_change": round(pct, 2) if pct is not None else None,
             "p_value": round(p, 4),
             "confidence": round((1 - p) * 100, 2),
             "is_significant": significant,
