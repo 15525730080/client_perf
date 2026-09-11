@@ -12,7 +12,7 @@ A client performance collection and analysis tool supporting **PC / Android / iO
 
 ## 实例截图 / Screenshots
 
-<details>
+<details open>
 <summary><b>点击展开所有截图 / Click to expand all screenshots</b></summary>
 
 **任务列表 / Task List**
