@@ -298,7 +298,14 @@ async def screenshot(pid, save_dir, include_child=False):
 
 
 async def cpu(pid, include_child=False):
-    process = psutil.Process(int(pid))
+    start_time = int(time.time())
+    try:
+        process = psutil.Process(int(pid))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        # 无效 PID / 无权限 / 无数据源：相关数值字段为 None，所有字段始终存在
+        return {"cpu_usage": None, "cpu_usage_all": None,
+                "cpu_core_num": psutil.cpu_count(), "time": start_time}
+
     get_main_cpu = asyncio.to_thread(process.cpu_percent, interval=1)
     tasks = [get_main_cpu]
     if include_child:
@@ -313,14 +320,20 @@ async def cpu(pid, include_child=False):
         "cpu_usage": total_cpu_usage / cpu_count,
         "cpu_usage_all": total_cpu_usage,
         "cpu_core_num": cpu_count,
-        "time": int(time.time())
+        "time": start_time
     }
     print_json(res)
     return res
 
 
 async def memory(pid, include_child=False):
-    process = psutil.Process(int(pid))
+    start_time = int(time.time())
+    try:
+        process = psutil.Process(int(pid))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        # 无效 PID / 无权限 / 无数据源：相关数值字段为 None，所有字段始终存在
+        return {"process_memory_usage": None, "time": start_time}
+
     get_main_mem = asyncio.to_thread(lambda: process.memory_info().rss / (1024 ** 2))
     tasks = [get_main_mem]
     if include_child:
@@ -330,7 +343,7 @@ async def memory(pid, include_child=False):
                           for sub_p in p_chs])
     all_mem_values = await asyncio.gather(*tasks, return_exceptions=True)
     total_memory = sum(v for v in all_mem_values if not isinstance(v, Exception))
-    res = {"process_memory_usage": total_memory, "time": int(time.time())}
+    res = {"process_memory_usage": total_memory, "time": start_time}
     print_json(res)
     return res
 
@@ -338,11 +351,17 @@ async def memory(pid, include_child=False):
 async def fps(pid, include_child=False):
     pid = int(pid)
     if platform.system() != "Windows":
-        return {"type": "fps", "time": int(time.time())}
+        # 非 Windows 无 FPS 数据源：数值字段为 None，frames 用空列表，所有字段始终存在
+        res = {"type": "fps", "fps": None, "frames": [], "time": int(time.time())}
+        print_json(res)
+        return res
     frames = WinFps(pid).fps()
     if not frames:
-        return frames
-    res = {"type": "fps", "fps": len(frames), "frames": frames, "time": int(frames[0]) if frames else int(time.time())}
+        # 暂无 FPS 数据：frames 用空列表，fps 为 None，所有字段始终存在
+        res = {"type": "fps", "fps": None, "frames": [], "time": int(time.time())}
+        print_json(res)
+        return res
+    res = {"type": "fps", "fps": len(frames), "frames": frames, "time": int(frames[0])}
     print_json(res)
     return res
 
@@ -351,148 +370,168 @@ async def gpu(pid, include_child=False):
     pid = int(pid)
 
     def real_func(pid):
+        start_time = int(time.time())
+        try:
+            process = psutil.Process(int(pid))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            # 无效 PID / 无权限 / 无数据源：数值字段为 None，所有字段始终存在
+            return {"gpu": None, "time": start_time}
+
         pids = [pid]
         if include_child:
-            process = psutil.Process(int(pid))
-            p_chs = process.children(recursive=True)
-            if p_chs:
-                sub_pid = [sub_p.pid for sub_p in p_chs]
-                pids.extend(sub_pid)
-        start_time = int(time.time())
-        sum_gpu = 0
-        if SUPPORT_GPU:
+            try:
+                p_chs = process.children(recursive=True)
+                if p_chs:
+                    pids.extend([sub_p.pid for sub_p in p_chs])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        if not SUPPORT_GPU:
+            # 平台不支持 GPU 采集：数值字段为 None，所有字段始终存在
+            return {"gpu": None, "time": start_time}
+
+        try:
             device_count = pynvml.nvmlDeviceGetCount()
-            res = None
             gpu_utilization_percentage = None
             for i in range(device_count):
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                 processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                for process in processes:
-                    if process.pid in pids:
+                for proc in processes:
+                    if proc.pid in pids:
                         gpu_Utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
                         gpu_utilization_percentage = gpu_Utilization.gpu  # GPU的计算使用率
-                        sum_gpu += gpu_utilization_percentage
-            res = {"gpu": gpu_utilization_percentage, "time": start_time}
-            return res
-        else:
-            return {"time": start_time}
+            return {"gpu": gpu_utilization_percentage, "time": start_time}
+        except Exception as e:
+            logger.error(f"获取GPU数据失败: {str(e)}")
+            # 采集失败：数值字段为 None，所有字段始终存在
+            return {"gpu": None, "time": start_time}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func, pid), timeout=10)
 
 
 async def process_info(pid, include_child=False):
     start_time = int(time.time())
-    process = psutil.Process(int(pid))
-    num_handles = None
-    if hasattr(process, "num_handles"):
-        get_main_num_handles = asyncio.to_thread(process.num_handles)
-    get_main_num_threads = asyncio.to_thread(process.num_threads)
-    if hasattr(process, "num_handles"):
-        handles_task = [get_main_num_handles]
-    threads_task = [get_main_num_threads]
+    try:
+        process = psutil.Process(int(pid))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        # 无效 PID / 无权限 / 无数据源：相关数值字段为 None，所有字段始终存在
+        return {"time": start_time, "num_handles": None, "num_threads": None}
+
+    support_handles = hasattr(process, "num_handles")
+    num_handles = 0 if support_handles else None
+    num_threads = 0
+
+    handles_task = [asyncio.to_thread(process.num_handles)] if support_handles else []
+    threads_task = [asyncio.to_thread(process.num_threads)]
     if include_child:
         children = process.children(recursive=True)
         if children:
-            if hasattr(process, "num_handles"):
+            if support_handles:
                 handles_task.extend([asyncio.to_thread(child.num_handles) for child in children])
             threads_task.extend([asyncio.to_thread(child.num_threads) for child in children])
-    if hasattr(process, "num_handles"):
+
+    if handles_task:
         all_num_handles_values = await asyncio.gather(*handles_task, return_exceptions=True)
-    all_num_threads_values = await asyncio.gather(*threads_task, return_exceptions=True)
-    if hasattr(process, "num_handles"):
         num_handles = sum(v for v in all_num_handles_values if not isinstance(v, Exception))
+    all_num_threads_values = await asyncio.gather(*threads_task, return_exceptions=True)
     num_threads = sum(v for v in all_num_threads_values if not isinstance(v, Exception))
-    res = {"time": start_time}
-    if num_handles: res["num_handles"] = num_handles
-    if num_threads: res["num_threads"] = num_threads
+
+    # 所有字段始终存在：支持且采集到 0 保留 0；不支持则保持 None
+    res = {"time": start_time, "num_handles": num_handles, "num_threads": num_threads}
     return res
 
 
 async def disk_io(pid, include_child=False):
-    """监控进程的磁盘I/O指标"""
-    process = psutil.Process(int(pid))
-    # 获取初始IO计数
+    """监控进程的磁盘I/O指标（聚合主进程 + 递归子进程）"""
+    start_time = int(time.time())
+
+    def _none_result():
+        # 采集失败 / 无数据源 / 无效 PID：相关数值字段为 None，所有字段始终存在
+        return {"disk_read_rate": None, "disk_write_rate": None,
+                "disk_read": None, "disk_write": None, "time": start_time}
+
     try:
-        # 获取主进程的IO计数器
-        get_main_io = asyncio.to_thread(process.io_counters)
-        prev_io = await get_main_io
-        prev_disk_read = prev_io.read_bytes
-        prev_disk_write = prev_io.write_bytes
-        
-        # 休眠一小段时间以计算速率
+        process = psutil.Process(int(pid))
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+        # 无效 PID / 无权限 / 无数据源：相关数值字段为 None，所有字段始终存在
+        return _none_result()
+
+    # 收集主进程 + 递归子进程；任一进程退出/无权限时忽略，不影响其余聚合
+    targets = [process]
+    if include_child:
+        try:
+            children = process.children(recursive=True)
+            targets.extend(children)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    def read_snapshot(procs):
+        """一次性快照所有目标进程的累计读写字节数；进程异常则跳过。"""
+        snap = {}
+        for p in procs:
+            try:
+                io = p.io_counters()
+                snap[p.pid] = (io.read_bytes, io.write_bytes)
+            except Exception:
+                # 进程可能在两次快照间退出，或无权访问，跳过该进程
+                pass
+        return snap
+
+    try:
+        prev = await asyncio.to_thread(read_snapshot, targets)
         await asyncio.sleep(1)
-        
-        # 获取更新后的IO计数器
-        current_io = await asyncio.to_thread(process.io_counters)
-        disk_read = current_io.read_bytes
-        disk_write = current_io.write_bytes
-        
-        # 计算磁盘I/O速率，增加最小检测阈值
-        disk_read_rate = max(0, (disk_read - prev_disk_read) / MB_CONVERSION) 
-        disk_write_rate = max(0, (disk_write - prev_disk_write) / MB_CONVERSION)
-        
-        # 忽略小于1KB的读写操作
-        if disk_read_rate < 0.001:  # 约1KB/s
+        curr = await asyncio.to_thread(read_snapshot, targets)
+
+        # 所有目标进程都无法提供 io_counters（如平台不支持磁盘 I/O）：视为无数据源
+        if not prev and not curr:
+            return _none_result()
+
+        prev_read = sum(v[0] for v in prev.values())
+        prev_write = sum(v[1] for v in prev.values())
+        curr_read = sum(v[0] for v in curr.values())
+        curr_write = sum(v[1] for v in curr.values())
+
+        disk_read_rate = max(0, (curr_read - prev_read) / MB_CONVERSION)
+        disk_write_rate = max(0, (curr_write - prev_write) / MB_CONVERSION)
+
+        # 忽略小于约1KB/s 的读写操作（真实采集到 0 仍保留 0）
+        if disk_read_rate < 0.001:
             disk_read_rate = 0
         if disk_write_rate < 0.001:
             disk_write_rate = 0
-            
+
         res = {
             "disk_read_rate": round(disk_read_rate, 2),  # MB/s
             "disk_write_rate": round(disk_write_rate, 2),  # MB/s
-            "disk_read": disk_read,  # 总读取字节数
-            "disk_write": disk_write,  # 总写入字节数
-            "time": int(time.time())
+            "disk_read": curr_read,  # 总读取字节数（主+递归子进程累计）
+            "disk_write": curr_write,  # 总写入字节数（主+递归子进程累计）
+            "time": start_time
         }
-        
+
         logger.info(json.dumps(res))
         return res
     except (psutil.AccessDenied, AttributeError) as e:
         logger.error(f"获取磁盘I/O数据失败: {str(e)}")
-        return {"disk_read_rate": 0, "disk_write_rate": 0, "time": int(time.time())}
+        return _none_result()
 
 
 async def network_io(pid, include_child=False):
-    """监控进程的网络I/O指标"""
+    """监控进程的网络I/O指标。
+
+    注意：psutil.net_io_counters() 仅提供整机（机器级）网络统计，
+    并非按 PID 拆分，不存在可靠的“按 PID 字节源”可聚合主进程与子进程。
+    为避免用整机值冒充进程数据，且遵循“无数据源相关字段为 None”的规范，
+    这里统一返回 None，所有字段始终存在。
+    如需真正的按 PID 网络统计需借助平台专用手段（如 Linux /proc、ETW 等）。
+    """
     start_time = int(time.time())
-    
-    try:
-        # 获取初始网络计数
-        net_io = psutil.net_io_counters()
-        prev_net_sent = net_io.bytes_sent
-        prev_net_recv = net_io.bytes_recv
-        
-        # 休眠一小段时间以计算速率
-        await asyncio.sleep(1)
-        
-        # 获取更新后的网络计数
-        current_net_io = psutil.net_io_counters()
-        net_sent = current_net_io.bytes_sent
-        net_recv = current_net_io.bytes_recv
-        
-        # 计算网络IO速率
-        net_sent_rate = max(0, (net_sent - prev_net_sent) / MB_CONVERSION)
-        net_recv_rate = max(0, (net_recv - prev_net_recv) / MB_CONVERSION)
-        
-        # 忽略小于1KB的网络传输
-        if net_sent_rate < 0.001:
-            net_sent_rate = 0
-        if net_recv_rate < 0.001:
-            net_recv_rate = 0
-            
-        res = {
-            "net_sent_rate": round(net_sent_rate, 2),  # MB/s
-            "net_recv_rate": round(net_recv_rate, 2),  # MB/s
-            "net_sent": net_sent,  # 总发送字节数
-            "net_recv": net_recv,  # 总接收字节数
-            "time": start_time
-        }
-        
-        logger.info(json.dumps(res))
-        return res
-    except Exception as e:
-        logger.error(f"获取网络I/O数据失败: {str(e)}")
-        return {"net_sent_rate": 0, "net_recv_rate": 0, "time": start_time}
+    return {
+        "net_sent_rate": None,  # MB/s
+        "net_recv_rate": None,  # MB/s
+        "net_sent": None,  # 总发送字节数
+        "net_recv": None,  # 总接收字节数
+        "time": start_time
+    }
 
 
 async def perf(pid, save_dir, include_child):

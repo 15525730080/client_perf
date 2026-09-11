@@ -210,7 +210,69 @@ def _read_proc_pid_stat(d, pid: int) -> Optional[Dict]:
         return None
 
 
-async def android_cpu(serial: str, pid: int = 0, package_name: str = "", **kwargs) -> Dict:
+def _read_proc_pid_rss(d, pid: int) -> Optional[int]:
+    """读取 /proc/<pid>/status 的 VmRSS（单位 kB）。
+
+    源缺失/不可读（权限不足、进程结束、文件不存在）返回 None；
+    仅当真实解析到数值（包括 0）时才返回该整数。
+    """
+    out = d.shell(f"cat /proc/{pid}/status 2>/dev/null").strip()
+    if not out or "No such file" in out or "Permission denied" in out:
+        return None
+    m = re.search(r'VmRSS:\s+(\d+)\s+kB', out)
+    return int(m.group(1)) if m else None
+
+
+def _get_descendant_pids(d, main_pid: int) -> set:
+    """
+    通过 ps -A -o PID,PPID 构建进程树，返回 main_pid 及其所有后代 PID 集合。
+    每轮重新发现（rediscover），以反映进程树变化。
+    """
+    output = d.shell("ps -A -o PID,PPID 2>/dev/null || ps -A -o PID,PPID").strip()
+    children = {}
+    for line in output.split('\n')[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                p = int(parts[0])
+                pp = int(parts[1])
+                children.setdefault(pp, []).append(p)
+            except (ValueError, IndexError):
+                continue
+    result = set()
+    stack = [main_pid]
+    while stack:
+        cur = stack.pop()
+        if cur in result:
+            continue
+        result.add(cur)
+        for c in children.get(cur, []):
+            if c not in result:
+                stack.append(c)
+    return result
+
+
+def _get_target_pids(d, main_pid: int, include_child: bool) -> set:
+    """固定主 PID：include_child=False 仅主 PID；True 包含后代。"""
+    if not main_pid:
+        return set()
+    if not include_child:
+        return {main_pid}
+    return _get_descendant_pids(d, main_pid)
+
+
+def _get_tree_uids(d, pid_set: set) -> set:
+    """收集进程树涉及的所有 UID（去重）。"""
+    uids = set()
+    for p in pid_set:
+        out = d.shell(f"cat /proc/{p}/status 2>/dev/null | grep -i '^Uid'").strip()
+        m = re.search(r'Uid:\s+(\d+)', out)
+        if m:
+            uids.add(int(m.group(1)))
+    return uids
+
+
+async def android_cpu(serial: str, pid: int = 0, package_name: str = "", include_child: bool = False, **kwargs) -> Dict:
     """
     采集 Android 进程 CPU 使用率
     使用 /proc/stat 和 /proc/<pid>/stat 计算精确的 CPU 占用率
@@ -219,47 +281,61 @@ async def android_cpu(serial: str, pid: int = 0, package_name: str = "", **kwarg
         d = _get_device(serial)
         current_time = int(time.time())
 
-        # 获取目标 PID
-        target_pid = pid
-        if not target_pid and package_name:
+        # 固定主 PID；一旦 pid 非 0，不使用 package_name 替换主 PID
+        main_pid = pid
+        if not main_pid and package_name:
             pid_output = d.shell(f"pidof {package_name}").strip()
             if pid_output:
                 parts = pid_output.split()
-                target_pid = int(parts[0]) if parts[0].isdigit() else 0
+                main_pid = int(parts[0]) if parts[0].isdigit() else 0
 
         # 获取 CPU 核心数
         cpu_cores_output = d.shell("cat /proc/cpuinfo | grep processor | wc -l").strip()
         cpu_cores = int(cpu_cores_output) if cpu_cores_output.isdigit() else 1
 
-        if not target_pid:
-            return {"cpu_usage": 0, "cpu_usage_all": 0, "cpu_core_num": cpu_cores, "time": current_time}
+        if not main_pid:
+            # 无 PID：进程级 CPU 指标不可用，相关数值字段返回 None；
+            # cpu_core_num 为设备级信息，保留真实值。
+            return {"cpu_usage": None, "cpu_usage_all": None, "cpu_core_num": cpu_cores, "time": current_time}
+
+        # 进程树 PID 集合（include_child 时每轮递归发现后代）
+        pid_set = _get_target_pids(d, main_pid, include_child)
 
         # 第一次采样
         sys_stat1 = _read_proc_stat_cpu(d)
-        pid_stat1 = _read_proc_pid_stat(d, target_pid)
+        pid_stats1 = {p: _read_proc_pid_stat(d, p) for p in pid_set}
 
         time.sleep(1)
 
         # 第二次采样
         sys_stat2 = _read_proc_stat_cpu(d)
-        pid_stat2 = _read_proc_pid_stat(d, target_pid)
+        pid_stats2 = {p: _read_proc_pid_stat(d, p) for p in pid_set}
 
-        cpu_usage_all = 0.0
-        cpu_usage = 0.0
-
+        # 系统整体 CPU：依赖 /proc/stat，读取失败或无法计算差值时为 None；
+        # 真实采集到的 0（完全空闲）保留 0。
+        cpu_usage_all = None
         if sys_stat1 and sys_stat2:
             sys_delta = sys_stat2["total"] - sys_stat1["total"]
-            sys_idle_delta = sys_stat2["idle"] - sys_stat1["idle"]
             if sys_delta > 0:
-                # 系统整体 CPU 使用率
+                sys_idle_delta = sys_stat2["idle"] - sys_stat1["idle"]
                 cpu_usage_all = round((1 - sys_idle_delta / sys_delta) * 100, 2)
 
-        if pid_stat1 and pid_stat2 and sys_stat1 and sys_stat2:
-            pid_delta = pid_stat2["total"] - pid_stat1["total"]
+        # 进程树 CPU：依赖 /proc/stat 与 /proc/<pid>/stat，任一源缺失（权限/进程结束）时为 None；
+        # 真实采集到的 0（采样窗口内无 CPU 占用）保留 0。
+        cpu_usage = None
+        if sys_stat1 and sys_stat2:
             sys_delta = sys_stat2["total"] - sys_stat1["total"]
             if sys_delta > 0:
-                # 进程 CPU 使用率（相对于单核）
-                cpu_usage = round(pid_delta / sys_delta * 100 * cpu_cores, 2)
+                total_pid_delta = 0
+                any_readable = False
+                for p in pid_set:
+                    s1 = pid_stats1.get(p)
+                    s2 = pid_stats2.get(p)
+                    if s1 and s2:
+                        any_readable = True
+                        total_pid_delta += (s2["total"] - s1["total"])
+                if any_readable:
+                    cpu_usage = round(total_pid_delta / sys_delta * 100 * cpu_cores, 2)
 
         res = {
             "cpu_usage": cpu_usage,
@@ -275,52 +351,78 @@ async def android_cpu(serial: str, pid: int = 0, package_name: str = "", **kwarg
 
 # ─────────────────────────── 内存采集 ───────────────────────────
 
-async def android_memory(serial: str, pid: int = 0, package_name: str = "", **kwargs) -> Dict:
+async def android_memory(serial: str, pid: int = 0, package_name: str = "", include_child: bool = False, **kwargs) -> Dict:
     """
     采集 Android 进程内存使用
     优先使用 dumpsys meminfo 获取 PSS 内存，失败则用 /proc/<pid>/status
+    include_child=True 时按进程树汇总各进程 VmRSS
     """
     def real_func():
         d = _get_device(serial)
-        target = package_name if package_name else str(pid)
-        if not target or target == "0":
-            return {"process_memory_usage": 0, "time": int(time.time())}
+        # 固定主 PID；一旦 pid 非 0，不使用 package_name 替换主 PID
+        main_pid = pid
+        if not main_pid and package_name:
+            pid_output = d.shell(f"pidof {package_name}").strip()
+            if pid_output:
+                parts = pid_output.split()
+                main_pid = int(parts[0]) if parts[0].isdigit() else 0
+        if not main_pid:
+            # 无 PID：进程级内存指标不可用
+            return {"process_memory_usage": None, "time": int(time.time())}
 
-        memory_mb = 0.0
+        # 进程树 PID 集合
+        pid_set = _get_target_pids(d, main_pid, include_child)
 
-        # 方法1: dumpsys meminfo（最准确，获取 PSS）
-        try:
-            output = d.shell(f"dumpsys meminfo {target} 2>/dev/null")
-            if output.strip():
-                # 尝试多种格式
-                # 格式1: "TOTAL PSS:    xxxxx"
-                match = re.search(r'TOTAL\s+PSS:\s+(\d+)', output)
-                if match:
-                    memory_mb = int(match.group(1)) / 1024.0
-                else:
-                    # 格式2: "TOTAL    xxxxx    xxxxx    xxxxx"
-                    match = re.search(r'TOTAL\s+(\d+)', output)
+        memory_mb = None
+        got_value = False
+        if len(pid_set) > 1:
+            # 存在后代：逐进程汇总 VmRSS；任一进程源缺失（权限/结束）则整体不可用
+            total_kb = 0
+            all_readable = True
+            for p in pid_set:
+                rss = _read_proc_pid_rss(d, p)
+                if rss is None:
+                    all_readable = False
+                    break
+                total_kb += rss
+            if all_readable:
+                memory_mb = total_kb / 1024.0
+                got_value = True
+        else:
+            # 单进程：优先 dumpsys meminfo（最准确，获取 PSS）
+            target = str(main_pid)
+            try:
+                output = d.shell(f"dumpsys meminfo {target} 2>/dev/null")
+                if output.strip():
+                    # 尝试多种格式
+                    # 格式1: "TOTAL PSS:    xxxxx"
+                    match = re.search(r'TOTAL\s+PSS:\s+(\d+)', output)
                     if match:
                         memory_mb = int(match.group(1)) / 1024.0
+                        got_value = True
                     else:
-                        # 格式3: "    TOTAL:   xxxxx kB"
-                        match = re.search(r'TOTAL:\s+(\d+)\s+kB', output, re.IGNORECASE)
+                        # 格式2: "TOTAL    xxxxx    xxxxx    xxxxx"
+                        match = re.search(r'TOTAL\s+(\d+)', output)
                         if match:
                             memory_mb = int(match.group(1)) / 1024.0
-        except Exception as e:
-            logger.warning(f"dumpsys meminfo 失败: {e}")
-
-        # 方法2: /proc/<pid>/status（备用）
-        if memory_mb == 0 and pid:
-            try:
-                status_output = d.shell(f"cat /proc/{pid}/status 2>/dev/null")
-                match = re.search(r'VmRSS:\s+(\d+)\s+kB', status_output)
-                if match:
-                    memory_mb = int(match.group(1)) / 1024.0
+                            got_value = True
+                        else:
+                            # 格式3: "    TOTAL:   xxxxx kB"
+                            match = re.search(r'TOTAL:\s+(\d+)\s+kB', output, re.IGNORECASE)
+                            if match:
+                                memory_mb = int(match.group(1)) / 1024.0
+                                got_value = True
             except Exception as e:
-                logger.warning(f"/proc/pid/status 读取失败: {e}")
+                logger.warning(f"dumpsys meminfo 失败: {e}")
 
-        res = {"process_memory_usage": round(memory_mb, 2), "time": int(time.time())}
+            # 备用：/proc/<pid>/status；源缺失（权限/进程结束）时为 None。
+            # 仅当 dumpsys 未给出有效值时回退，避免把真实 0 误覆盖为 None。
+            if not got_value:
+                rss = _read_proc_pid_rss(d, main_pid)
+                memory_mb = (rss / 1024.0) if rss is not None else None
+
+        res = {"process_memory_usage": (round(memory_mb, 2) if memory_mb is not None else None),
+               "time": int(time.time())}
         print_json(res)
         return res
 
@@ -350,15 +452,18 @@ async def android_fps(serial: str, pid: int = 0, package_name: str = "", **kwarg
             current_package = package_name
 
         if not current_package:
-            return {"type": "fps", "fps": 0, "frames": [], "time": current_time}
+            # 无法定位目标应用：FPS 不可用；frames 始终为 []
+            return {"type": "fps", "fps": None, "frames": [], "time": current_time}
 
         # 方法1: 使用 gfxinfo framestats（更准确）
+        source_available = False
         try:
             # 重置统计
             d.shell(f"dumpsys gfxinfo {current_package} reset 2>/dev/null")
             time.sleep(1)
             output = d.shell(f"dumpsys gfxinfo {current_package} framestats 2>/dev/null")
             if output.strip():
+                source_available = True
                 result = _parse_gfxinfo_framestats(output, current_time)
                 if result["fps"] > 0:
                     return result
@@ -371,6 +476,7 @@ async def android_fps(serial: str, pid: int = 0, package_name: str = "", **kwarg
             time.sleep(1)
             output = d.shell(f"dumpsys SurfaceFlinger --latency '{current_package}' 2>/dev/null")
             if output.strip() and "\n" in output:
+                source_available = True
                 lines = output.strip().split('\n')
                 frame_timestamps = []
                 for line in lines[1:]:
@@ -393,7 +499,10 @@ async def android_fps(serial: str, pid: int = 0, package_name: str = "", **kwarg
         except Exception:
             pass
 
-        return {"type": "fps", "fps": 0, "frames": [], "time": current_time}
+        # 源存在但采样窗口内无帧（真实 0）保留 0；源完全无法读取则不可用
+        if source_available:
+            return {"type": "fps", "fps": 0, "frames": [], "time": current_time}
+        return {"type": "fps", "fps": None, "frames": [], "time": current_time}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=20)
 
@@ -513,29 +622,48 @@ async def android_gpu(serial: str, pid: int = 0, package_name: str = "", **kwarg
 
 # ─────────────────────────── 进程信息 ───────────────────────────
 
-async def android_process_info(serial: str, pid: int = 0, package_name: str = "", **kwargs) -> Dict:
-    """采集 Android 进程的线程数等信息"""
+async def android_process_info(serial: str, pid: int = 0, package_name: str = "", include_child: bool = False, **kwargs) -> Dict:
+    """采集 Android 进程的线程数等信息（include_child 时按进程树汇总）。
+
+    无 PID、进程源读取失败（权限不足/进程结束）时相关数值字段返回 None；
+    字段始终存在；真实采集到的 0 保留 0。
+    """
     def real_func():
         d = _get_device(serial)
         start_time = int(time.time())
-        target_pid = pid
-        if not target_pid and package_name:
+        # 固定主 PID；一旦 pid 非 0，不使用 package_name 替换主 PID
+        main_pid = pid
+        if not main_pid and package_name:
             pid_output = d.shell(f"pidof {package_name}").strip()
             if pid_output:
                 parts = pid_output.split()
-                target_pid = int(parts[0]) if parts[0].isdigit() else 0
+                main_pid = int(parts[0]) if parts[0].isdigit() else 0
 
+        if not main_pid:
+            # 无 PID：线程/句柄等进程级信息不可用
+            return {"time": start_time, "num_threads": None, "num_handles": None}
+
+        # 进程树 PID 集合
+        pid_set = _get_target_pids(d, main_pid, include_child)
+
+        # 按进程树汇总线程数与 fd 数；任一进程 /proc/<pid>/status 不可读则整体不可用
         num_threads = 0
-        if target_pid:
-            # 获取线程数
-            thread_output = d.shell(f"ls /proc/{target_pid}/task 2>/dev/null | wc -l").strip()
-            num_threads = int(thread_output) if thread_output.isdigit() else 0
+        num_fds = None
+        all_readable = True
+        for p in pid_set:
+            out = d.shell(f"cat /proc/{p}/status 2>/dev/null").strip()
+            if not out or "No such file" in out or "Permission denied" in out:
+                all_readable = False
+                break
+            thread_match = re.search(r'^Threads:\s*(\d+)', out, re.MULTILINE)
+            num_threads += int(thread_match.group(1)) if thread_match else 0
+            fd_match = re.search(r'^FDSize:\s+(\d+)', out, re.MULTILINE)
+            if fd_match and int(fd_match.group(1)) > 0:
+                num_fds = (num_fds or 0) + int(fd_match.group(1))
 
-        # Android 没有 Windows 的 handle 概念，用 fd 数量代替
-        num_fds = 0
-        if target_pid:
-            fd_output = d.shell(f"ls /proc/{target_pid}/fd 2>/dev/null | wc -l").strip()
-            num_fds = int(fd_output) if fd_output.isdigit() else 0
+        if not all_readable:
+            num_threads = None
+            num_fds = None
 
         res = {"time": start_time, "num_threads": num_threads, "num_handles": num_fds}
         return res
@@ -545,27 +673,27 @@ async def android_process_info(serial: str, pid: int = 0, package_name: str = ""
 
 # ─────────────────────────── 磁盘 IO ───────────────────────────
 
-async def android_disk_io(serial: str, pid: int = 0, package_name: str = "", **kwargs) -> Dict:
-    """采集 Android 进程磁盘 I/O"""
+async def android_disk_io(serial: str, pid: int = 0, package_name: str = "", include_child: bool = False, **kwargs) -> Dict:
+    """采集 Android 进程磁盘 I/O（include_child 时按进程树汇总 /proc/<pid>/io）"""
     MB_CONVERSION = 1024 * 1024
 
     def real_func():
         d = _get_device(serial)
-        target_pid = pid
-        if not target_pid and package_name:
+        # 固定主 PID；一旦 pid 非 0，不使用 package_name 替换主 PID
+        main_pid = pid
+        if not main_pid and package_name:
             pid_output = d.shell(f"pidof {package_name}").strip()
             if pid_output:
                 parts = pid_output.split()
-                target_pid = int(parts[0]) if parts[0].isdigit() else 0
+                main_pid = int(parts[0]) if parts[0].isdigit() else 0
 
-        if not target_pid:
-            return {"disk_read_rate": 0, "disk_write_rate": 0,
-                    "disk_read": 0, "disk_write": 0, "time": int(time.time())}
+        if not main_pid:
+            # 无 PID：进程级磁盘 IO 不可用
+            return {"disk_read_rate": None, "disk_write_rate": None,
+                    "disk_read": None, "disk_write": None, "time": int(time.time())}
 
-        # 读取 /proc/pid/io 获取 IO 数据
-        io_output1 = d.shell(f"cat /proc/{target_pid}/io 2>/dev/null").strip()
-        time.sleep(1)
-        io_output2 = d.shell(f"cat /proc/{target_pid}/io 2>/dev/null").strip()
+        # 进程树 PID 集合
+        pid_set = _get_target_pids(d, main_pid, include_child)
 
         def parse_io(output):
             result = {}
@@ -578,13 +706,27 @@ async def android_disk_io(serial: str, pid: int = 0, package_name: str = "", **k
                         result[key] = int(val)
             return result
 
-        io1 = parse_io(io_output1)
-        io2 = parse_io(io_output2)
+        def read_io(p):
+            """读取 /proc/<pid>/io；源缺失（权限/进程结束）返回 None，否则返回解析字典。"""
+            out = d.shell(f"cat /proc/{p}/io 2>/dev/null").strip()
+            if not out or "No such file" in out or "Permission denied" in out:
+                return None
+            return parse_io(out)
 
-        read_bytes1 = io1.get('read_bytes', 0)
-        write_bytes1 = io1.get('write_bytes', 0)
-        read_bytes2 = io2.get('read_bytes', 0)
-        write_bytes2 = io2.get('write_bytes', 0)
+        # 读取进程树各进程 /proc/<pid>/io
+        io1 = {p: read_io(p) for p in pid_set}
+        time.sleep(1)
+        io2 = {p: read_io(p) for p in pid_set}
+
+        # 任一进程源缺失则无法计算进程级磁盘 IO
+        if any(v is None for v in io1.values()) or any(v is None for v in io2.values()):
+            return {"disk_read_rate": None, "disk_write_rate": None,
+                    "disk_read": None, "disk_write": None, "time": int(time.time())}
+
+        read_bytes1 = sum(v.get('read_bytes', 0) for v in io1.values())
+        write_bytes1 = sum(v.get('write_bytes', 0) for v in io1.values())
+        read_bytes2 = sum(v.get('read_bytes', 0) for v in io2.values())
+        write_bytes2 = sum(v.get('write_bytes', 0) for v in io2.values())
 
         disk_read_rate = max(0, (read_bytes2 - read_bytes1) / MB_CONVERSION)
         disk_write_rate = max(0, (write_bytes2 - write_bytes1) / MB_CONVERSION)
@@ -608,11 +750,13 @@ async def android_disk_io(serial: str, pid: int = 0, package_name: str = "", **k
 
 # ─────────────────────────── 网络 IO ───────────────────────────
 
-async def android_network_io(serial: str, pid: int = 0, package_name: str = "", **kwargs) -> Dict:
+async def android_network_io(serial: str, pid: int = 0, package_name: str = "", include_child: bool = False, **kwargs) -> Dict:
     """
-    采集 Android 设备网络 I/O
-    优先使用 /proc/net/xt_qtaguid/stats 获取进程级网络流量，
-    失败则回退到 /proc/net/dev 设备级统计
+    采集 Android 进程树网络 I/O
+    按进程树涉及的 UID 集合聚合 /proc/net/xt_qtaguid/stats，UID 去重。
+    绝对禁止回退 /proc/net/dev 整机统计。
+    无 PID、UID 无法获取、xt_qtaguid 源不可用（缺失/权限不足）时返回 None；
+    源存在但无流量（差值为 0）时保留真实 0。
     """
     MB_CONVERSION = 1024 * 1024
 
@@ -620,74 +764,63 @@ async def android_network_io(serial: str, pid: int = 0, package_name: str = "", 
         d = _get_device(serial)
         start_time = int(time.time())
 
-        # 尝试获取进程 UID（用于进程级网络统计）
-        uid = None
-        target_pid = pid
-        if not target_pid and package_name:
+        # 固定主 PID；一旦 pid 非 0，不使用 package_name 替换主 PID
+        main_pid = pid
+        if not main_pid and package_name:
             pid_output = d.shell(f"pidof {package_name}").strip()
             if pid_output:
                 parts = pid_output.split()
-                target_pid = int(parts[0]) if parts[0].isdigit() else 0
+                main_pid = int(parts[0]) if parts[0].isdigit() else 0
 
-        if target_pid:
-            uid_output = d.shell(f"cat /proc/{target_pid}/status 2>/dev/null | grep Uid").strip()
-            match = re.search(r'Uid:\s+(\d+)', uid_output)
-            if match:
-                uid = int(match.group(1))
+        if not main_pid:
+            # 无 PID：进程级网络 IO 不可用
+            return {"net_sent_rate": None, "net_recv_rate": None,
+                    "net_sent": None, "net_recv": None, "time": start_time}
 
-        def get_net_stats_by_uid(uid_val):
-            """通过 UID 获取进程级网络统计"""
+        # 进程树 PID 集合 -> UID 集合（去重）
+        pid_set = _get_target_pids(d, main_pid, include_child)
+        uid_set = _get_tree_uids(d, pid_set)
+
+        if not uid_set:
+            # 无法获取进程 UID（权限不足/进程源缺失），无进程级数据源
+            return {"net_sent_rate": None, "net_recv_rate": None,
+                    "net_sent": None, "net_recv": None, "time": start_time}
+
+        def get_net_stats_by_uid_set(uid_set_val):
+            """按 UID 集合聚合进程级网络统计；xt_qtaguid 源缺失返回 None，否则返回 (rx, tx)。"""
             output = d.shell("cat /proc/net/xt_qtaguid/stats 2>/dev/null").strip()
-            if not output:
-                return None, None
+            if not output or "No such file" in output or "Permission denied" in output:
+                return None
             rx_bytes = tx_bytes = 0
             for line in output.split('\n')[1:]:
                 parts = line.strip().split()
                 if len(parts) >= 8:
                     try:
-                        if int(parts[3]) == uid_val:
+                        if int(parts[3]) in uid_set_val:
                             rx_bytes += int(parts[5])
                             tx_bytes += int(parts[7])
                     except (ValueError, IndexError):
                         continue
             return rx_bytes, tx_bytes
 
-        def get_net_stats_device():
-            """读取设备级网络统计"""
-            rx_bytes = tx_bytes = 0
-            output = d.shell("cat /proc/net/dev").strip()
-            for line in output.split('\n')[2:]:
-                parts = line.strip().split()
-                if len(parts) >= 10 and ':' in parts[0]:
-                    iface = parts[0].replace(':', '')
-                    if iface not in ('lo',):
-                        try:
-                            rx_bytes += int(parts[1])
-                            tx_bytes += int(parts[9])
-                        except (ValueError, IndexError):
-                            continue
-            return rx_bytes, tx_bytes
-
         # 第一次采样
-        if uid is not None:
-            rx1, tx1 = get_net_stats_by_uid(uid)
-            if rx1 is None:
-                rx1, tx1 = get_net_stats_device()
-        else:
-            rx1, tx1 = get_net_stats_device()
+        s1 = get_net_stats_by_uid_set(uid_set)
 
         time.sleep(1)
 
         # 第二次采样
-        if uid is not None:
-            rx2, tx2 = get_net_stats_by_uid(uid)
-            if rx2 is None:
-                rx2, tx2 = get_net_stats_device()
-        else:
-            rx2, tx2 = get_net_stats_device()
+        s2 = get_net_stats_by_uid_set(uid_set)
 
-        net_recv_rate = max(0, ((rx2 or 0) - (rx1 or 0)) / MB_CONVERSION)
-        net_sent_rate = max(0, ((tx2 or 0) - (tx1 or 0)) / MB_CONVERSION)
+        if s1 is None or s2 is None:
+            # 源读取失败：进程级网络 IO 不可用
+            return {"net_sent_rate": None, "net_recv_rate": None,
+                    "net_sent": None, "net_recv": None, "time": start_time}
+
+        rx1, tx1 = s1
+        rx2, tx2 = s2
+
+        net_recv_rate = max(0, (rx2 - rx1) / MB_CONVERSION)
+        net_sent_rate = max(0, (tx2 - tx1) / MB_CONVERSION)
 
         if net_recv_rate < 0.001:
             net_recv_rate = 0
@@ -697,8 +830,8 @@ async def android_network_io(serial: str, pid: int = 0, package_name: str = "", 
         res = {
             "net_sent_rate": round(net_sent_rate, 4),
             "net_recv_rate": round(net_recv_rate, 4),
-            "net_sent": tx2 or 0,
-            "net_recv": rx2 or 0,
+            "net_sent": tx2,
+            "net_recv": rx2,
             "time": start_time
         }
         return res
@@ -791,16 +924,19 @@ async def android_perf(serial: str, package_name: str, pid: int, save_dir: str, 
     monitors = {
         "cpu": Monitor(android_cpu,
                        serial=serial, pid=pid, package_name=package_name,
+                       include_child=include_child,
                        monitor_name="cpu",
                        key_value=["time", "cpu_usage(%)", "cpu_usage_all(%)", "cpu_core_num(个)"],
                        save_dir=save_dir),
         "memory": Monitor(android_memory,
                           serial=serial, pid=pid, package_name=package_name,
+                          include_child=include_child,
                           monitor_name="memory",
                           key_value=["time", "process_memory_usage(M)"],
                           save_dir=save_dir),
         "process_info": Monitor(android_process_info,
                                 serial=serial, pid=pid, package_name=package_name,
+                                include_child=include_child,
                                 monitor_name="process_info",
                                 key_value=["time", "num_threads(个)", "num_handles(个)"],
                                 save_dir=save_dir),
@@ -816,12 +952,14 @@ async def android_perf(serial: str, package_name: str, pid: int, save_dir: str, 
                        save_dir=save_dir),
         "disk_io": Monitor(android_disk_io,
                            serial=serial, pid=pid, package_name=package_name,
+                           include_child=include_child,
                            monitor_name="disk_io",
                            key_value=["time", "disk_read_rate(MB/s)", "disk_write_rate(MB/s)",
                                       "disk_read(字节)", "disk_write(字节)"],
                            save_dir=save_dir),
         "network_io": Monitor(android_network_io,
                               serial=serial, pid=pid, package_name=package_name,
+                              include_child=include_child,
                               monitor_name="network_io",
                               key_value=["time", "net_sent_rate(MB/s)", "net_recv_rate(MB/s)",
                                          "net_sent(字节)", "net_recv(字节)"],

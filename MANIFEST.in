@@ -1,0 +1,10 @@
+# Ship all package sources; native acceleration (mypyc) is built on demand
+# after installation via `nativebuild`, not at packaging time.
+recursive-include client_perf *.py
+include LICENSE
+include README.md
+include README.es-ES.md
+include pyproject.toml
+recursive-include client_perf/test_result *.html
+recursive-include client_perf/tool *
+recursive-include tests *.py
