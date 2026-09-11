@@ -57,12 +57,19 @@ class TaskHandle(Process):
                 self._run_android()
             elif self.device_type == "ios":
                 self._run_ios()
+            elif self.device_type == "ios_simulator":
+                self._run_ios_simulator()
             elif self.device_type == "harmony":
                 self._run_harmony()
             else:
                 self._run_pc()
         except Exception:
             logger.error(traceback.format_exc())
+        finally:
+            try:
+                asyncio.run(TaskCollection.stop_task(self.task_id))
+            except Exception:
+                logger.error("更新已结束任务状态失败:\n%s", traceback.format_exc())
 
     # ── 各平台采集 ────────────────────────────────────────────
 
@@ -92,6 +99,18 @@ class TaskHandle(Process):
         asyncio.run(
             ios_perf(
                 udid=self.device_id,
+                bundle_id=self.package_name or "",
+                pid=self.target_pid,
+                save_dir=self.file_dir,
+                include_child=self.include_child,
+            )
+        )
+
+    def _run_ios_simulator(self) -> None:
+        from client_perf.core.ios_simulator_tools import ios_simulator_perf
+        asyncio.run(
+            ios_simulator_perf(
+                udid=self.device_id or "booted",
                 bundle_id=self.package_name or "",
                 pid=self.target_pid,
                 save_dir=self.file_dir,

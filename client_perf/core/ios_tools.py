@@ -33,9 +33,21 @@ from client_perf.log import log as logger
 from client_perf.core.monitor import Monitor
 
 # ── py-ios-device (Instruments DTX 协议) ──────────────────────────────────
-from ios_device.remote.remote_lockdown import RemoteLockdownClient
-from ios_device.cli.base import InstrumentsBase
-_PY_IOS_DEVICE_AVAILABLE = True
+# 可选依赖：缺失时整体降级，go-ios 基础能力（列表/截图/电池）仍可用，
+# 仅 Instruments 高级采集（CPU/内存/网络/磁盘/FPS/GPU）不可用。
+try:
+    from ios_device.remote.remote_lockdown import RemoteLockdownClient
+    from ios_device.util.lockdown import LockdownClient
+    from ios_device.cli.base import InstrumentsBase
+    _PY_IOS_DEVICE_AVAILABLE = True
+except Exception as _ios_device_import_err:  # 常见：未安装 py-ios-device / pyOpenSSL 版本不兼容
+    logger.warning(
+        f"py-ios-device 不可用，Instruments 高级采集降级: {_ios_device_import_err}"
+    )
+    RemoteLockdownClient = None
+    LockdownClient = None
+    InstrumentsBase = None
+    _PY_IOS_DEVICE_AVAILABLE = False
 
 # ─────────────────────────── go-ios 路径 ───────────────────────────
 
@@ -59,17 +71,20 @@ def get_ios_tool_path():
             return tool_dir.joinpath("go-ios-linux", "ios-amd64")
     return None
 
-_DOWNLOADS_IOS = str(get_ios_tool_path())
+_bundled_ios_path = get_ios_tool_path()
+_BUNDLED_IOS = str(_bundled_ios_path) if _bundled_ios_path else None
 GO_IOS_PATH = (
     os.environ.get("GO_IOS_PATH")
-    or (_DOWNLOADS_IOS if os.path.isfile(_DOWNLOADS_IOS) else None)
+    or (_BUNDLED_IOS if _BUNDLED_IOS and os.path.isfile(_BUNDLED_IOS) else None)
     or shutil.which("ios")
     or shutil.which("go-ios")
 )
 
-if not os.path.isfile(GO_IOS_PATH):
+if not GO_IOS_PATH or not os.path.isfile(GO_IOS_PATH):
     GO_IOS_PATH = None
     logger.warning("go-ios 未找到，iOS 性能测试不可用")
+elif os.name != "nt" and not os.access(GO_IOS_PATH, os.X_OK):
+    logger.warning("go-ios 不可执行，请检查文件权限: %s", GO_IOS_PATH)
 
 
 def _go_ios_env() -> dict:
@@ -110,10 +125,27 @@ def _run_json(args: list, timeout: int = 15):
     raw = _run(args, timeout)
     if not raw:
         return None
-    # go-ios 输出可能有多行，每行一个 JSON，也可能前面有 warning 行
-    # 找最后一个合法 JSON
-    lines = raw.strip().split("\n")
-    for line in reversed(lines):
+    # go-ios 既可能输出单个/格式化多行 JSON，也可能在 JSON 前输出日志行。
+    # 先尝试整体解析，兼容 `tunnel ls` 的多行数组；失败后再从每个可能的
+    # JSON 起始位置解析，最后兼容逐行 JSON 日志格式。
+    text = raw.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if not text[index + end:].strip():
+            return value
+
+    for line in reversed(text.splitlines()):
         line = line.strip()
         if not line:
             continue
@@ -141,22 +173,36 @@ class TunnelManager:
     _proc: Optional[subprocess.Popen] = None
     _tunnel_procs: List[subprocess.Popen] = []
     _admin_warned = False
+    # 保护 ensure_tunnel/start，避免并发重复启动同一个 tunnel
+    _lock = threading.Lock()
 
     @classmethod
     def ensure_tunnel(cls, udid: str = "") -> bool:
-        """确保 tunnel 已启动，返回是否可用"""
-        info = cls.tunnel_info()
-        if info:
-            return True
-        return cls.start(udid)
+        """确保指定设备的 tunnel 已启动，返回是否可用。
+
+        加锁 + 按 UDID 判断现有 tunnel：若 tunnel ls 已包含该设备的
+        可用连接，则直接返回，避免重复启动。
+        """
+        with cls._lock:
+            if cls.tunnel_info_for_udid(udid):
+                return True
+            return cls.start(udid)
 
     @classmethod
     def tunnel_info(cls) -> Optional[list]:
-        """查询已有 tunnel"""
+        """查询已有 tunnel 列表"""
         data = _run_json(["tunnel", "ls"])
         if isinstance(data, list) and data:
             return data
         return None
+
+    @classmethod
+    def tunnel_info_for_udid(cls, udid: str = "") -> Optional[Dict]:
+        """从已有 tunnel 中筛选指定设备的连接；未指定 UDID 时返回第一条。"""
+        tunnels = cls.tunnel_info()
+        if not tunnels:
+            return None
+        return _select_tunnel(tunnels, udid)
 
     @classmethod
     def start(cls, udid: str = "") -> bool:
@@ -182,17 +228,19 @@ class TunnelManager:
             args += ["--udid", udid]
         env = os.environ.copy()
         env["ENABLE_GO_IOS_AGENT"] = "user"
+        # 注意：不读取 stdout/stderr，因此使用 DEVNULL 而非 PIPE，
+        # 避免子进程阻塞在填满管道缓冲区（未消费的 PIPE 导致死锁）。
         try:
             proc = subprocess.Popen(
-                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env=env, encoding="utf-8"
+                args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env
             )
             cls._proc = proc
             cls._tunnel_procs.append(proc)
             # 等待 tunnel 建立
             for _ in range(20):
                 time.sleep(1)
-                if cls.tunnel_info():
+                if cls.tunnel_info_for_udid(udid):
                     logger.info("go-ios tunnel 已启动")
                     return True
             logger.error("go-ios tunnel 启动超时")
@@ -255,6 +303,58 @@ def _first_udid() -> Optional[str]:
         if dl:
             return dl[0]
     return None
+
+
+def _parse_ios_major(version: object) -> Optional[int]:
+    """解析 iOS 主版本号；无法识别时返回 None。"""
+    if version is None:
+        return None
+    try:
+        return int(str(version).strip().split(".", 1)[0])
+    except (TypeError, ValueError):
+        return None
+
+
+# ── iOS 版本缓存 ──────────────────────────────────────────────
+# 避免每个 sysmontap / graphics 连接都重复执行 `ios info`。
+# 仅在查询成功（拿到非 None 版本）时缓存，查询失败不缓存以便后续重试。
+_IOS_VERSION_CACHE: Dict[str, str] = {}
+_IOS_VERSION_CACHE_LOCK = threading.Lock()
+
+
+def _get_ios_version(udid: str) -> Optional[str]:
+    """通过 go-ios 查询指定设备的系统版本（带进程内缓存）。"""
+    with _IOS_VERSION_CACHE_LOCK:
+        cached = _IOS_VERSION_CACHE.get(udid)
+        if cached is not None:
+            return cached
+    info = _run_json(["info", "--udid", udid]) or {}
+    version = info.get("ProductVersion") if isinstance(info, dict) else None
+    version = str(version).strip() if version else None
+    if version:
+        with _IOS_VERSION_CACHE_LOCK:
+            _IOS_VERSION_CACHE[udid] = version
+    return version
+
+
+def _clear_ios_version_cache(udid: Optional[str] = None) -> None:
+    """清除 iOS 版本缓存（设备断开或版本变化时调用）。"""
+    with _IOS_VERSION_CACHE_LOCK:
+        if udid is None:
+            _IOS_VERSION_CACHE.clear()
+        else:
+            _IOS_VERSION_CACHE.pop(udid, None)
+
+
+def _requires_tunnel(udid: str) -> bool:
+    """iOS 17+ 使用 Remote Service Discovery；旧系统走 USB lockdown。"""
+    version = _get_ios_version(udid)
+    major = _parse_ios_major(version)
+    if major is None:
+        # 未知版本时不贸然启动 tunnel；先走 USB 直连，失败日志会保留原因。
+        logger.warning(f"无法识别 iOS 版本，优先尝试 USB 直连: udid={udid}")
+        return False
+    return major >= 17
 
 
 # ─────────────────────────── 自动获取前台应用 ───────────────────────────
@@ -447,16 +547,31 @@ def _read_sysmontap_sample(udid: str, skip_count: int = 2) -> Optional[Dict]:
 
 # ─────────────────────────── Instruments Session (py-ios-device) ───────────────────────────
 
-def _get_tunnel_info() -> Optional[Dict]:
-    """从 go-ios tunnel ls 获取当前 tunnel 的地址和端口"""
+def _select_tunnel(tunnels: object, udid: str = "") -> Optional[Dict]:
+    """从 tunnel 列表中选择指定设备；未指定 UDID 时返回第一条。"""
+    if not isinstance(tunnels, list) or not tunnels:
+        return None
+    if not udid:
+        return tunnels[0]
+    for tunnel in tunnels:
+        if not isinstance(tunnel, dict):
+            continue
+        tunnel_udid = tunnel.get("udid") or tunnel.get("serial") or tunnel.get("identifier")
+        if tunnel_udid == udid:
+            return tunnel
+    return None
+
+
+def _get_tunnel_info(udid: str = "") -> Optional[Dict]:
+    """从 go-ios tunnel ls 获取指定设备 tunnel 的地址和端口。"""
     raw = _run(["tunnel", "ls"], timeout=5)
     if not raw:
         return None
     # 先尝试整体解析（tunnel ls 输出格式化多行 JSON）
     try:
-        tunnels = json.loads(raw.strip())
-        if isinstance(tunnels, list) and tunnels:
-            return tunnels[0]
+        tunnel = _select_tunnel(json.loads(raw.strip()), udid)
+        if tunnel:
+            return tunnel
     except Exception:
         pass
     # fallback：逐行找 JSON 数组行（单行输出格式）
@@ -464,9 +579,9 @@ def _get_tunnel_info() -> Optional[Dict]:
         line = line.strip()
         if line.startswith("["):
             try:
-                tunnels = json.loads(line)
-                if isinstance(tunnels, list) and tunnels:
-                    return tunnels[0]
+                tunnel = _select_tunnel(json.loads(line), udid)
+                if tunnel:
+                    return tunnel
             except Exception:
                 pass
     return None
@@ -541,14 +656,53 @@ class _InstrumentsSession:
     # ── 连接管理 ──────────────────────────────────────────────────
 
     def _make_lockdown(self):
-        info = _get_tunnel_info()
-        if not info:
+        if not _PY_IOS_DEVICE_AVAILABLE:
             raise RuntimeError(
-                "go-ios tunnel 未启动，请先运行: "
-                "ENABLE_GO_IOS_AGENT=user ios tunnel start --userspace"
+                "py-ios-device 不可用，无法建立 Instruments 连接。"
+                "请安装依赖: uv add py-ios-device"
             )
+
+        version = _get_ios_version(self.udid)
+        major = _parse_ios_major(version)
+
+        if major is not None and major < 17:
+            logger.info(
+                f"[Instruments] iOS {version} 使用 USB lockdown 直连，"
+                "无需 go-ios tunnel"
+            )
+            return LockdownClient(udid=self.udid, network=False)
+
+        if major is None:
+            logger.warning(
+                f"[Instruments] 无法识别 iOS 版本，先尝试 USB lockdown 直连: "
+                f"udid={self.udid}"
+            )
+            try:
+                return LockdownClient(udid=self.udid, network=False)
+            except Exception as usb_error:
+                logger.warning(f"[Instruments] USB 直连失败，尝试 tunnel: {usb_error}")
+
+        if not TunnelManager.ensure_tunnel(self.udid):
+            raise RuntimeError(
+                f"iOS {version or '17+'} 需要 go-ios tunnel，但自动启动失败。"
+                "请检查设备连接、配对和权限。"
+            )
+
+        info = _get_tunnel_info(self.udid)
+        if not info:
+            raise RuntimeError("go-ios tunnel 已启动但未返回当前设备的可用连接信息")
+
+        # 字段完整性校验，缺失时给出明确错误而非 KeyError
+        address = info.get("address")
+        rsd_port = info.get("rsdPort")
+        if address is None or rsd_port is None:
+            raise RuntimeError(
+                "go-ios tunnel 连接信息不完整，缺少 address 或 rsdPort 字段: "
+                f"{info}"
+            )
+
         lockdown = RemoteLockdownClient(
-            address=(info["address"], info["rsdPort"]),
+            address=(address, rsd_port),
             userspace_port=info.get("userspaceTunPort")
         )
         lockdown.connect()
@@ -787,6 +941,15 @@ class _InstrumentsSession:
 
         return {"proc": proc_data, "sys": sys_data}
 
+    def get_proc_cache(self) -> Dict:
+        """返回当前缓存的全部进程数据副本（{pid: {proc_attrs}}）。
+
+        供 include_child 递归聚合使用：调用方先 get_latest(pid) 确保后台
+        采集已就绪，再读此缓存按 pid 聚合主进程及其后代。
+        """
+        with self._lock:
+            return dict(self._cache.get("procs", {}))
+
 
 # ── 全局管理：按 udid 获取 session ────────────────────────────────
 
@@ -806,52 +969,190 @@ def ios_instruments_stop(udid: str):
         logger.info(f"[Instruments] 已停止 udid={udid}")
 
 
+# ─────────────────────────── 进程树 / 递归聚合辅助 ───────────────────────────
+
+# iOS 进程树（{pid: ppid}）缓存，短 TTL，避免每轮重复 `go-ios ps`（较慢）。
+_IOS_PID_TREE_CACHE: Dict[str, Dict[int, int]] = {}
+_IOS_PID_TREE_TS: Dict[str, float] = {}
+_IOS_PID_TREE_TTL = 5.0
+_IOS_PID_TREE_LOCK = threading.Lock()
+
+
+def _ios_build_pid_tree(udid: str) -> Dict[int, int]:
+    """构建 {pid: ppid} 映射（来自 go-ios ps）。
+
+    找不到父字段或缺省时返回 {}，由调用方降级为“仅主 PID”。
+    """
+    with _IOS_PID_TREE_LOCK:
+        cached = _IOS_PID_TREE_CACHE.get(udid)
+        ts = _IOS_PID_TREE_TS.get(udid, 0.0)
+        if cached is not None and (time.time() - ts) < _IOS_PID_TREE_TTL:
+            return cached
+
+    tree: Dict[int, int] = {}
+    raw = _run(["ps", "--udid", udid], timeout=8)
+    if raw:
+        for line in reversed(raw.strip().split("\n")):
+            try:
+                processes = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(processes, list):
+                continue
+            for p in processes:
+                pid_val = p.get("Pid")
+                if pid_val is None:
+                    continue
+                # go-ios ps 父字段可能为 ParentPid 或 Ppid
+                ppid = p.get("ParentPid")
+                if ppid is None:
+                    ppid = p.get("Ppid")
+                if ppid is None:
+                    continue
+                try:
+                    tree[int(pid_val)] = int(ppid)
+                except (TypeError, ValueError):
+                    continue
+
+    with _IOS_PID_TREE_LOCK:
+        _IOS_PID_TREE_CACHE[udid] = tree
+        _IOS_PID_TREE_TS[udid] = time.time()
+    return tree
+
+
+def _ios_descendant_pids(udid: str, pid: int) -> List[int]:
+    """返回以 pid 为根的全部后代进程 pid（含自身），按进程树递归。
+
+    - 无法构建父子树（ps 失败 / 无 ppid 字段）时仅返回 [pid]，
+      保证主 PID 固定、不漂移。
+    - 主 PID 始终位于结果首位且必被包含。
+    """
+    if not pid:
+        return [pid]
+
+    tree = _ios_build_pid_tree(udid)
+    if not tree:
+        return [pid]
+
+    children_map: Dict[int, List[int]] = {}
+    for p, ppid in tree.items():
+        children_map.setdefault(ppid, []).append(p)
+
+    result: List[int] = []
+    seen: set = set()
+    stack = [pid]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        result.append(cur)
+        for c in children_map.get(cur, []):
+            if c not in seen:
+                stack.append(c)
+
+    if not result:
+        result = [pid]
+    return result
+
+
+def _ios_aggregate_proc_metrics(udid: str, pid: int, include_child: bool) -> Dict:
+    """从 Instruments procs 缓存聚合主进程（+ 递归子进程）的 cpu/mem/thread。
+
+    - 主 PID 始终固定包含；后代 pid 若不在缓存中则忽略，不影响主 PID。
+    - include_child=False 时仅聚合主 PID。
+    返回: {"cpuUsage", "physFootprint", "threadCount", "sys"}
+    """
+    session = _InstrumentsSession.get(udid)
+    # 确保后台采集已启动并拿到首次数据（内部阻塞等待），同时拿到 sys 缓存
+    data = session.get_latest(pid)
+    sys_data = dict(data.get("sys", {}))
+    procs = session.get_proc_cache()
+
+    pids: List[int] = [pid]
+    if include_child:
+        pids = list(dict.fromkeys(_ios_descendant_pids(udid, pid)))
+        if pid not in pids:
+            pids = [pid] + pids  # 主 PID 固定首位，绝不漂移
+
+    cpu = 0.0
+    mem = 0.0
+    threads = 0
+    for p in pids:
+        pd = procs.get(p)
+        if not pd:
+            continue
+        try:
+            cpu += float(pd.get("cpuUsage") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            mem += float(pd.get("physFootprint") or 0)
+        except (TypeError, ValueError):
+            pass
+        tc = pd.get("threadCount")
+        if tc is not None:
+            try:
+                threads += int(tc)
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "cpuUsage": cpu,
+        "physFootprint": mem,
+        "threadCount": threads,
+        "sys": sys_data,
+    }
+
+
 # ─────────────────────────── CPU 采集 ───────────────────────────
 
-async def ios_cpu(udid: str, pid: int = 0, **kwargs) -> Optional[Dict]:
+async def ios_cpu(udid: str, pid: int = 0, include_child: bool = False, **kwargs) -> Optional[Dict]:
     """
     采集 CPU 使用率。
-    优先使用 py-ios-device Instruments（进程级 cpuUsage + 系统总负载）。
+    优先使用 py-ios-device Instruments（进程级 cpuUsage + 系统总负载），
+    并按 include_child 递归聚合主进程及其后代。
     fallback 到 go-ios sysmontap（仅系统总负载）。
     """
 
     def real_func():
         current_time = int(time.time())
-        # ── Instruments 方案（读缓存，< 50ms）────────────────────────
-        if _PY_IOS_DEVICE_AVAILABLE:
+        # 进程级 CPU 依赖 Instruments（按 PID 采集）。无 PID / 无 Instruments 源 /
+        # 采集失败 → 对应字段为 None；真实采集到 0 保留 0。
+        if _PY_IOS_DEVICE_AVAILABLE and pid:
             try:
-                data = _InstrumentsSession.get(udid).get_latest(pid)
-                proc = data.get("proc", {})
-                cpu_usage = round(float(proc.get("cpuUsage") or 0), 2)
+                agg = _ios_aggregate_proc_metrics(udid, pid, include_child)
+                cpu_usage = round(float(agg.get("cpuUsage") or 0), 2)
                 return {
                     "cpu_usage": cpu_usage,
+                    # Instruments 路径无独立系统负载源，沿用进程值；二者均依赖 PID
                     "cpu_usage_all": cpu_usage,
-                    "cpu_core_num": 0,
+                    "cpu_core_num": None,  # Instruments 进程属性不含核心数源
                     "time": current_time,
                 }
             except Exception as e:
                 logger.warning(f"Instruments CPU 采集失败，fallback go-ios: {e}")
-        # ── fallback: go-ios sysmontap（仅系统总负载）──────────────
+        # ── fallback: go-ios sysmontap（仅系统总负载，无法按 pid 拆分进程 CPU）──
         data = _read_sysmontap_sample(udid, skip_count=2)
         if data:
             return {
-                "cpu_usage": 0,
+                "cpu_usage": None,  # sysmontap 无法按 PID 拆分进程 CPU
                 "cpu_usage_all": round(data.get("cpu_total_load", 0), 2),
-                "cpu_core_num": data.get("cpu_count", 0),
+                "cpu_core_num": data.get("cpu_count", 0) or None,
                 "time": current_time,
             }
-        return {"cpu_usage": 0, "cpu_usage_all": 0, "cpu_core_num": 0, "time": current_time}
+        return {"cpu_usage": None, "cpu_usage_all": None, "cpu_core_num": None, "time": current_time}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=25)
 
 
 # ─────────────────────────── 内存采集 ───────────────────────────
 
-async def ios_memory(udid: str, pid: int = 0, **kwargs) -> Optional[Dict]:
+async def ios_memory(udid: str, pid: int = 0, include_child: bool = False, **kwargs) -> Optional[Dict]:
     """
     采集内存使用。
     使用 py-ios-device Instruments:
-      - 进程内存: physFootprint (bytes) → MB
+      - 进程内存: physFootprint (bytes) → MB（按 include_child 递归聚合）
       - 系统总内存: physMemSize (pages * 16384) → MB
       - 系统空闲: vmFreeCount (pages * 16384) → MB
     """
@@ -859,28 +1160,27 @@ async def ios_memory(udid: str, pid: int = 0, **kwargs) -> Optional[Dict]:
 
     def real_func():
         current_time = int(time.time())
+        # 进程内存依赖 PID + Instruments；系统总内存（不依赖 PID）与进程内存均可能
+        # 因无源 / 无 PID / 采集失败而不可用 → None。真实采集到 0 保留 0。
+        proc_mem = None
+        mem_total = None
         if _PY_IOS_DEVICE_AVAILABLE:
             try:
-                data = _InstrumentsSession.get(udid).get_latest(pid)
-                proc = data.get("proc", {})
-                sys  = data.get("sys", {})
-
-                # 进程物理内存 (bytes → MB)
-                phys = proc.get("physFootprint") or 0
-                proc_mem_mb = round(phys / (1024 * 1024), 2)
-
+                agg = _ios_aggregate_proc_metrics(udid, pid, include_child)
+                sys = agg.get("sys", {})
+                if pid:
+                    phys = agg.get("physFootprint") or 0
+                    proc_mem = round(phys / (1024 * 1024), 2)
                 # 系统总内存 (pages → MB)
                 phys_mem_pages = sys.get("physMemSize") or 0
-                mem_total_mb = round(phys_mem_pages * PAGE_SIZE / (1024 * 1024), 2)
-
-                return {
-                    "process_memory_usage": proc_mem_mb,
-                    "memory_total": mem_total_mb,
-                    "time": current_time,
-                }
+                mem_total = round(phys_mem_pages * PAGE_SIZE / (1024 * 1024), 2)
             except Exception as e:
                 logger.warning(f"Instruments Memory 采集失败: {e}")
-        return {"process_memory_usage": 0, "memory_total": 0, "time": current_time}
+        return {
+            "process_memory_usage": proc_mem,
+            "memory_total": mem_total,
+            "time": current_time,
+        }
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=25)
 
@@ -895,17 +1195,18 @@ async def ios_fps(udid: str, pid: int = 0, **kwargs) -> Optional[Dict]:
     """
     def real_func():
         current_time = int(time.time())
+        # FPS 依赖 Instruments Graphics 源（按屏幕渲染）。无源 / 采集失败 → fps 为
+        # None；frames 始终为 []（无 FPS 明细时）。真实采集到 0 保留 0。
         if _PY_IOS_DEVICE_AVAILABLE:
             try:
                 g = _InstrumentsSession.get(udid).get_graphics()
-                return {
-                    "fps": g.get("fps", 0),
-                    "frames": [],
-                    "time": current_time,
-                }
+                # 仅当成功收到过帧数据（ts>0）才视为有效；否则无源/采集失败 → None
+                if g.get("ts"):
+                    return {"fps": g.get("fps"), "frames": [], "time": current_time}
+                return {"fps": None, "frames": [], "time": current_time}
             except Exception as e:
                 logger.warning(f"Instruments FPS 采集失败: {e}")
-        return {"fps": 0, "frames": [], "time": current_time}
+        return {"fps": None, "frames": [], "time": current_time}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=15)
 
@@ -922,41 +1223,47 @@ async def ios_gpu(udid: str, pid: int = 0, **kwargs) -> Dict:
     """
     def real_func():
         current_time = int(time.time())
+        # GPU 依赖 Instruments Graphics 源。无源 / 采集失败 → 全部为 None；
+        # 真实采集到 0 保留 0。仅当成功收到过数据（ts>0）才视为有效。
         if _PY_IOS_DEVICE_AVAILABLE:
             try:
                 g = _InstrumentsSession.get(udid).get_graphics()
-                return {
-                    "gpu": g.get("gpu", 0.0),
-                    "gpu_renderer": g.get("gpu_renderer", 0.0),
-                    "gpu_tiler": g.get("gpu_tiler", 0.0),
-                    "time": current_time,
-                }
+                if g.get("ts"):
+                    return {
+                        "gpu": g.get("gpu"),
+                        "gpu_renderer": g.get("gpu_renderer"),
+                        "gpu_tiler": g.get("gpu_tiler"),
+                        "time": current_time,
+                    }
+                return {"gpu": None, "gpu_renderer": None, "gpu_tiler": None, "time": current_time}
             except Exception as e:
                 logger.warning(f"Instruments GPU 采集失败: {e}")
-        return {"gpu": 0.0, "gpu_renderer": 0.0, "gpu_tiler": 0.0, "time": current_time}
+        return {"gpu": None, "gpu_renderer": None, "gpu_tiler": None, "time": current_time}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=15)
 
 
 # ─────────────────────────── 进程信息 ───────────────────────────
 
-async def ios_process_info(udid: str, bundle_id: str = "", pid: int = 0, **kwargs) -> Dict:
+async def ios_process_info(udid: str, bundle_id: str = "", pid: int = 0, include_child: bool = False, **kwargs) -> Dict:
     """
     采集进程信息（线程数）。
-    优先从 Instruments sysmontap 缓存读取 threadCount（< 1ms）。
+    优先从 Instruments sysmontap 缓存读取 threadCount，并按 include_child
+    递归聚合主进程及其后代（< 1ms）。
     fallback 到 go-ios ps（较慢，超时 8s）。
     """
     def real_func():
         current_time = int(time.time())
-        num_threads = 0
+        num_threads = None
+        # 线程数依赖 PID + Instruments（或 go-ios ps）；无 PID / 无源 / 失败 → None。
+        # iOS 不支持 handles → num_handles 始终为 None。
 
-        # ── 优先：Instruments 缓存（threadCount 字段）────────────
+        # ── 优先：Instruments 缓存（threadCount 字段，递归聚合）──
         if _PY_IOS_DEVICE_AVAILABLE and pid:
             try:
-                data = _InstrumentsSession.get(udid).get_latest(pid)
-                tc = data.get("proc", {}).get("threadCount")
-                if tc is not None:
-                    return {"time": current_time, "num_threads": int(tc), "num_handles": 0}
+                agg = _ios_aggregate_proc_metrics(udid, pid, include_child)
+                num_threads = int(agg.get("threadCount") or 0)
+                return {"time": current_time, "num_threads": num_threads, "num_handles": None}
             except Exception:
                 pass
 
@@ -975,107 +1282,54 @@ async def ios_process_info(udid: str, bundle_id: str = "", pid: int = 0, **kwarg
                     except json.JSONDecodeError:
                         continue
 
-        return {"time": current_time, "num_threads": num_threads, "num_handles": 0}
+        return {"time": current_time, "num_threads": num_threads, "num_handles": None}
 
     return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=12)
 
 
 # ─────────────────────────── 网络 IO ───────────────────────────
 
-# 全局网络IO状态缓存（用于计算速率）
-_net_io_cache: Dict[str, Dict] = {}
-_net_io_lock = threading.Lock()
-
-
-async def ios_network_io(udid: str, pid: int = 0, **kwargs) -> Dict:
+async def ios_network_io(udid: str, pid: int = 0, include_child: bool = False, **kwargs) -> Dict:
     """
-    采集网络 I/O（系统级累计值 + 速率）。
-    使用 py-ios-device Instruments 的 netBytesIn / netBytesOut。
+    采集网络 I/O。
+
+    注意：py-ios-device Instruments 的 netBytesIn / netBytesOut 为系统级
+    整机累计值，并非按 PID 拆分的进程网络字节数；Instruments 也无可靠的
+    按 PID 网络字节源。iOS 真机不存在可信的“按进程网络”来源，按规范
+    “无进程网络/磁盘源为 None”，这里所有字段统一为 None，字段始终存在。
+    若后续引入按 PID 网络采集能力，可在此聚合主进程与递归子进程。
     """
-    MB = 1024 * 1024
-
-    def real_func():
-        current_time = int(time.time())
-        net_in = net_out = 0
-
-        if _PY_IOS_DEVICE_AVAILABLE:
-            try:
-                data = _InstrumentsSession.get(udid).get_latest(pid)
-                sys_d = data.get("sys", {})
-                net_in  = sys_d.get("netBytesIn")  or 0
-                net_out = sys_d.get("netBytesOut") or 0
-            except Exception as e:
-                logger.warning(f"Instruments Network 采集失败: {e}")
-
-        with _net_io_lock:
-            cache = _net_io_cache.get(udid)
-            if cache and net_in:
-                dt = current_time - cache["time"]
-                recv_rate = max(0, (net_in  - cache["net_in"])  / MB / dt) if dt > 0 else 0
-                sent_rate = max(0, (net_out - cache["net_out"]) / MB / dt) if dt > 0 else 0
-            else:
-                recv_rate = sent_rate = 0
-            if net_in or net_out:
-                _net_io_cache[udid] = {"time": current_time, "net_in": net_in, "net_out": net_out}
-
-        return {
-            "net_sent_rate": round(sent_rate, 4),
-            "net_recv_rate": round(recv_rate, 4),
-            "net_sent": net_out,
-            "net_recv": net_in,
-            "time": current_time,
-        }
-
-    return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=25)
+    current_time = int(time.time())
+    return {
+        "net_sent_rate": None,
+        "net_recv_rate": None,
+        "net_sent": None,
+        "net_recv": None,
+        "time": current_time,
+    }
 
 
 # ─────────────────────────── 磁盘 IO ───────────────────────────
 
-# 全局磁盘IO状态缓存
-_disk_io_cache: Dict[str, Dict] = {}
-_disk_io_lock = threading.Lock()
-
-
-async def ios_disk_io(udid: str, pid: int = 0, **kwargs) -> Dict:
+async def ios_disk_io(udid: str, pid: int = 0, include_child: bool = False, **kwargs) -> Dict:
     """
-    采集磁盘 I/O（系统级累计值 + 速率）。
-    使用 py-ios-device Instruments 的 diskBytesRead / diskBytesWritten。
+    采集磁盘 I/O。
+
+    注意：py-ios-device Instruments 的 diskBytesRead / diskBytesWritten 为
+    系统级整机累计值，并非按 PID 拆分的进程磁盘字节数。虽然 sysmontap 进程
+    属性中存在 diskBytesRead/Written，但其聚合依赖可靠的进程父子关系，且
+    当前策略以“不冒充进程数据”为准；iOS 真机不存在可信的“按进程磁盘”来源，
+    按规范“无进程网络/磁盘源为 None”，这里所有字段统一为 None，字段始终存在。
+    若后续引入可靠的按 PID 磁盘聚合，可在此聚合主进程与递归子进程。
     """
-    MB = 1024 * 1024
-
-    def real_func():
-        current_time = int(time.time())
-        disk_read = disk_write = 0
-
-        if _PY_IOS_DEVICE_AVAILABLE:
-            try:
-                data = _InstrumentsSession.get(udid).get_latest(pid)
-                sys_d = data.get("sys", {})
-                disk_read  = sys_d.get("diskBytesRead")    or 0
-                disk_write = sys_d.get("diskBytesWritten") or 0
-            except Exception as e:
-                logger.warning(f"Instruments DiskIO 采集失败: {e}")
-
-        with _disk_io_lock:
-            cache = _disk_io_cache.get(udid)
-            if cache and disk_read:
-                dt = current_time - cache["time"]
-                read_rate  = max(0, (disk_read  - cache["disk_read"])  / MB / dt) if dt > 0 else 0
-                write_rate = max(0, (disk_write - cache["disk_write"]) / MB / dt) if dt > 0 else 0
-            else:
-                read_rate = write_rate = 0
-            if disk_read or disk_write:
-                _disk_io_cache[udid] = {"time": current_time, "disk_read": disk_read, "disk_write": disk_write}
-
-        return {
-            "disk_read_rate": round(read_rate, 4),
-            "disk_write_rate": round(write_rate, 4),
-            "disk_read": disk_read,
-            "disk_write": disk_write,
-            "time": current_time,
-        }
-
-    return await asyncio.wait_for(asyncio.to_thread(real_func), timeout=25)
+    current_time = int(time.time())
+    return {
+        "disk_read_rate": None,
+        "disk_write_rate": None,
+        "disk_read": None,
+        "disk_write": None,
+        "time": current_time,
+    }
 
 
 # ─────────────────────────── 电池信息 ───────────────────────────
@@ -1181,7 +1435,9 @@ async def ios_perf(udid: str, bundle_id: str, pid: int, save_dir: str, include_c
     logger.info(f"iOS 性能采集: udid={udid}, bundle_id={bundle_id}, pid={pid}")
 
     # ── 预热 Instruments 后台采集线程（sysmontap + graphics）──────
-    # 必须在 Monitor 启动前完成，否则第一轮采集会因等待建连而超时
+    # 连接策略（iOS 版本 → USB/tunnel）统一在 _InstrumentsSession._make_lockdown
+    # 中处理，避免与 ios_perf 重复启动 tunnel。
+    # 必须在 Monitor 启动前完成，否则第一轮采集会因等待建连而超时。
     if _PY_IOS_DEVICE_AVAILABLE:
         session = _InstrumentsSession.get(udid)
         logger.info(f"[ios_perf] 预热 Instruments sysmontap...")
@@ -1192,17 +1448,17 @@ async def ios_perf(udid: str, bundle_id: str, pid: int, save_dir: str, include_c
 
     monitors = {
         "cpu": Monitor(ios_cpu,
-                       udid=udid, pid=pid,
+                       udid=udid, pid=pid, include_child=include_child,
                        monitor_name="cpu",
                        key_value=["time", "cpu_usage(%)", "cpu_usage_all(%)", "cpu_core_num(个)"],
                        save_dir=save_dir),
         "memory": Monitor(ios_memory,
-                          udid=udid, pid=pid,
+                          udid=udid, pid=pid, include_child=include_child,
                           monitor_name="memory",
                           key_value=["time", "process_memory_usage(M)", "memory_total(M)"],
                           save_dir=save_dir),
         "process_info": Monitor(ios_process_info,
-                                udid=udid, bundle_id=bundle_id, pid=pid,
+                                udid=udid, bundle_id=bundle_id, pid=pid, include_child=include_child,
                                 monitor_name="process_info",
                                 key_value=["time", "num_threads(个)", "num_handles(个)"],
                                 save_dir=save_dir),
@@ -1217,13 +1473,13 @@ async def ios_perf(udid: str, bundle_id: str, pid: int, save_dir: str, include_c
                        key_value=["time", "gpu(%)", "gpu_renderer(%)", "gpu_tiler(%)"],
                        save_dir=save_dir),
         "disk_io": Monitor(ios_disk_io,
-                           udid=udid, pid=pid,
+                           udid=udid, pid=pid, include_child=include_child,
                            monitor_name="disk_io",
                            key_value=["time", "disk_read_rate(MB/s)", "disk_write_rate(MB/s)",
                                       "disk_read(字节)", "disk_write(字节)"],
                            save_dir=save_dir),
         "network_io": Monitor(ios_network_io,
-                              udid=udid, pid=pid,
+                              udid=udid, pid=pid, include_child=include_child,
                               monitor_name="network_io",
                               key_value=["time", "net_sent_rate(MB/s)", "net_recv_rate(MB/s)",
                                          "net_sent(字节)", "net_recv(字节)"],

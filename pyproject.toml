@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "client-perf"
+dynamic = ["version"]
+description = "客户端性能采集与分析工具"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "15525730080" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+]
+dependencies = [
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.29.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "py-ios-device>=2.0.0",
+    "pyOpenSSL>=22.0.0,<26.2",
+    "adbutils>=2.8.0",
+    "psutil>=5.9.0",
+    "pynvml>=11.5.0",
+    "openpyxl>=3.1.0",
+    "Pillow>=10.0.0",
+    "pygetwindow>=0.0.9",
+]
+
+[project.optional-dependencies]
+native = ["mypy>=1.14", "setuptools>=68"]
+
+[project.scripts]
+client-perf = "client_perf.cli:main"
+nativebuild = "client_perf.native_build:main"
+
+[project.urls]
+Homepage = "https://github.com/15525730080/client_perf"
+Repository = "https://github.com/15525730080/client_perf"
+
+[dependency-groups]
+dev = [
+    "packaging>=24.0",
+    "pytest>=8.0",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "client_perf.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["client_perf*"]
+
+[tool.setuptools.package-data]
+client_perf = [
+    "test_result/*.html",
+    "test_result/**/*.html",
+    "tool/*",
+    "tool/**/*",
+]

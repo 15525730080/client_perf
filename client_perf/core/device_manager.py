@@ -15,9 +15,16 @@ from client_perf.log import log as logger
 DEVICE_TYPE_PC = "pc"
 DEVICE_TYPE_ANDROID = "android"
 DEVICE_TYPE_IOS = "ios"
+DEVICE_TYPE_IOS_SIMULATOR = "ios_simulator"
 DEVICE_TYPE_HARMONY = "harmony"
 
-ALL_DEVICE_TYPES = [DEVICE_TYPE_PC, DEVICE_TYPE_ANDROID, DEVICE_TYPE_IOS, DEVICE_TYPE_HARMONY]
+ALL_DEVICE_TYPES = [
+    DEVICE_TYPE_PC,
+    DEVICE_TYPE_ANDROID,
+    DEVICE_TYPE_IOS,
+    DEVICE_TYPE_IOS_SIMULATOR,
+    DEVICE_TYPE_HARMONY,
+]
 
 
 # ─────────────────────────── 统一设备管理 ───────────────────────────
@@ -50,7 +57,14 @@ class DeviceManager:
         except ImportError:
             logger.info("iOS 模块不可用")
 
-        # 4. HarmonyOS 设备
+        # 4. iOS Simulator（仅 macOS）
+        try:
+            from client_perf.core.ios_simulator_tools import get_ios_simulator_devices
+            devices.extend(get_ios_simulator_devices())
+        except ImportError:
+            logger.info("iOS Simulator 模块不可用")
+
+        # 5. HarmonyOS 设备
         try:
             from client_perf.core.harmony_tools import get_harmony_devices, HDC_AVAILABLE
             if HDC_AVAILABLE:
@@ -98,6 +112,15 @@ class DeviceManager:
         return []
 
     @classmethod
+    def get_ios_simulator_devices(cls) -> List[Dict]:
+        """获取本机 iOS Simulator 列表。"""
+        try:
+            from client_perf.core.ios_simulator_tools import get_ios_simulator_devices
+            return get_ios_simulator_devices()
+        except ImportError:
+            return []
+
+    @classmethod
     def get_harmony_devices(cls) -> List[Dict]:
         """获取 HarmonyOS 设备列表"""
         try:
@@ -135,6 +158,15 @@ class DeviceManager:
                 logger.error(f"获取 iOS 应用列表失败: {e}")
                 return []
 
+        elif device_type == DEVICE_TYPE_IOS_SIMULATOR:
+            try:
+                from client_perf.core.ios_simulator_tools import ios_simulator_apps
+                import asyncio
+                return asyncio.run(ios_simulator_apps(device_id))
+            except Exception as e:
+                logger.error(f"获取 iOS Simulator 应用列表失败: {e}")
+                return []
+
         elif device_type == DEVICE_TYPE_HARMONY:
             try:
                 from client_perf.core.harmony_tools import harmony_packages
@@ -163,6 +195,14 @@ class DeviceManager:
                 return await ios_apps(device_id)
             except Exception as e:
                 logger.error(f"获取 iOS 应用列表失败: {e}")
+                return []
+
+        elif device_type == DEVICE_TYPE_IOS_SIMULATOR:
+            try:
+                from client_perf.core.ios_simulator_tools import ios_simulator_apps
+                return await ios_simulator_apps(device_id)
+            except Exception as e:
+                logger.error(f"获取 iOS Simulator 应用列表失败: {e}")
                 return []
 
         elif device_type == DEVICE_TYPE_HARMONY:
@@ -198,6 +238,14 @@ class DeviceManager:
                 logger.error(f"获取 iOS 系统信息失败: {e}")
                 return {"platform": "iOS", "error": str(e), "time": time.time()}
 
+        elif device_type == DEVICE_TYPE_IOS_SIMULATOR:
+            try:
+                from client_perf.core.ios_simulator_tools import ios_simulator_sys_info
+                return await ios_simulator_sys_info(device_id)
+            except Exception as e:
+                logger.error(f"获取 iOS Simulator 系统信息失败: {e}")
+                return {"platform": "iOS Simulator", "error": str(e), "time": time.time()}
+
         elif device_type == DEVICE_TYPE_HARMONY:
             try:
                 from client_perf.core.harmony_tools import harmony_sys_info
@@ -232,6 +280,14 @@ class DeviceManager:
                 logger.error(f"iOS 截图失败: {e}")
                 return None
 
+        elif device_type == DEVICE_TYPE_IOS_SIMULATOR:
+            try:
+                from client_perf.core.ios_simulator_tools import ios_simulator_screenshot
+                return await ios_simulator_screenshot(device_id, save_dir)
+            except Exception as e:
+                logger.error(f"iOS Simulator 截图失败: {e}")
+                return None
+
         elif device_type == DEVICE_TYPE_HARMONY:
             try:
                 from client_perf.core.harmony_tools import harmony_screenshot
@@ -251,9 +307,11 @@ def get_platform_capabilities() -> Dict:
         "pc": True,  # PC 始终可用
         "android": False,
         "ios": False,
+        "ios_simulator": False,
         "harmony": False,
         "android_reason": "",
         "ios_reason": "",
+        "ios_simulator_reason": "",
         "harmony_reason": "",
     }
 
@@ -262,19 +320,43 @@ def get_platform_capabilities() -> Dict:
         import adbutils
         capabilities["android"] = True
     except ImportError:
-        capabilities["android_reason"] = "adbutils 未安装，请执行: pip install adbutils"
+        capabilities["android_reason"] = "adbutils 未安装，请执行: uv add adbutils"
 
-    # 检测 iOS 支持（基于 go-ios）
+    # 检测 iOS 支持（基于 go-ios；py-ios-device 提供高级采集）
     import shutil as _shutil
-    from client_perf.core.ios_tools import GO_IOS_PATH
+    try:
+        from client_perf.core.ios_tools import (
+            GO_IOS_PATH,
+            _PY_IOS_DEVICE_AVAILABLE,
+        )
+        ios_tools_importable = True
+    except Exception as _ios_e:
+        ios_tools_importable = False
+        GO_IOS_PATH = None
+        _PY_IOS_DEVICE_AVAILABLE = False
+        capabilities["ios_reason"] = f"ios_tools 导入失败: {_ios_e}"
 
     if GO_IOS_PATH:
         capabilities["ios"] = True
+        if not _PY_IOS_DEVICE_AVAILABLE:
+            capabilities["ios_reason"] = (
+                "已检测到 go-ios（基础能力可用），但 py-ios-device 缺失，"
+                "CPU/内存/FPS/GPU 等高级采集不可用，请安装: uv add py-ios-device"
+            )
     else:
         ios_reasons = []
         if not _shutil.which("ios") and not _shutil.which("go-ios"):
-            ios_reasons.append("go-ios 未找到，请安装并确保在 PATH 中，或设置 GO_IOS_PATH 环境变量")
+            ios_reasons.append(
+                "go-ios 未找到，请安装并确保在 PATH 中，或设置 GO_IOS_PATH 环境变量"
+            )
+        if not _PY_IOS_DEVICE_AVAILABLE:
+            ios_reasons.append("py-ios-device 未安装，高级采集不可用")
         capabilities["ios_reason"] = "；".join(ios_reasons) if ios_reasons else "go-ios 未找到"
+
+    # 检测 iOS Simulator 支持（macOS + Xcode Command Line Tools）
+    capabilities["ios_simulator"] = platform.system() == "Darwin" and bool(_shutil.which("xcrun"))
+    if not capabilities["ios_simulator"]:
+        capabilities["ios_simulator_reason"] = "仅支持安装了 Xcode Command Line Tools 的 macOS"
 
     # 检测 HarmonyOS 支持（基于 hdc）
     from client_perf.core.harmony_tools import HDC_PATH, HDC_AVAILABLE

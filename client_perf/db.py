@@ -29,16 +29,38 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 from client_perf.log import log as logger
+from client_perf.paths import PROJECT_ROOT as _PATH_PROJECT_ROOT, get_db_path
 
 # ── 数据库路径 ────────────────────────────────────────────────
-DB_PATH = os.path.join(os.getcwd(), "task.sqlite")
+# 保留 _PROJECT_ROOT 以兼容既有测试和旧数据库查找逻辑。
+_PROJECT_ROOT = str(_PATH_PROJECT_ROOT)
+
+
+def _resolve_db_path() -> str:
+    env_path = os.environ.get("CLIENT_PERF_DB_PATH")
+    if env_path:
+        return os.path.abspath(os.path.expanduser(env_path))
+
+    root_db = os.path.join(_PROJECT_ROOT, "task.sqlite")
+    if os.path.isfile(root_db):
+        return root_db
+
+    cwd_db = os.path.join(os.getcwd(), "task.sqlite")
+    if os.path.isfile(cwd_db):
+        return cwd_db
+
+    return str(get_db_path())
+
+
+DB_PATH = _resolve_db_path()
 _DB_URL  = f"sqlite+aiosqlite:///{DB_PATH}"
 
 # ── Engine & Session ──────────────────────────────────────────
+# timeout=5 等价于设置 busy_timeout 为 5s（并发写时自动等待而非立即报错）。
 _engine = create_async_engine(
     _DB_URL,
     echo=False,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False, "timeout": 5},
 )
 _Session = async_sessionmaker(_engine, expire_on_commit=False)
 
@@ -123,10 +145,15 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 
 async def _run_migrations() -> None:
     """
-    1. 用 ORM metadata 创建所有不存在的表（CREATE TABLE IF NOT EXISTS）。
-    2. 逐列检查 _MIGRATIONS，缺失则 ALTER TABLE ADD COLUMN（SQLite 支持）。
+    1. 启用 SQLite WAL + busy_timeout，提升并发健壮性。
+    2. 用 ORM metadata 创建所有不存在的表（CREATE TABLE IF NOT EXISTS）。
+    3. 逐列检查 _MIGRATIONS，缺失则 ALTER TABLE ADD COLUMN（SQLite 支持）。
     """
     async with _engine.begin() as conn:
+        # WAL 写入模式 + 忙等待超时（连接级，每次启动幂等设置）
+        await conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
+        await conn.exec_driver_sql("PRAGMA busy_timeout=5000;")
+
         # 建表（幂等）
         await conn.run_sync(_Base.metadata.create_all)
 
@@ -144,6 +171,7 @@ async def _run_migrations() -> None:
 
 async def create_tables() -> None:
     """对外入口：建表 + 迁移，在 FastAPI lifespan 中调用。"""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     await _run_migrations()
     logger.info(f"数据库就绪: {DB_PATH}")
 
@@ -212,6 +240,8 @@ class TaskCollection:
                 task_platform, serialno = "Android", device_id or ""
             elif device_type == "ios":
                 task_platform, serialno = "iOS", device_id or ""
+            elif device_type == "ios_simulator":
+                task_platform, serialno = "iOS Simulator", device_id or ""
             else:
                 task_platform = device_type
                 serialno = device_id or platform.node()
@@ -251,12 +281,22 @@ class TaskCollection:
     @classmethod
     async def stop_task(cls, task_id: int) -> dict[str, Any]:
         async with _Session() as s, s.begin():
-            await s.execute(
-                update(TaskModel)
-                .where(TaskModel.id == task_id)
-                .values(status=2, end_time=_now())
-            )
             task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            task.status = 2
+            task.end_time = _now()
+        return _model_to_dict(task)
+
+    @classmethod
+    async def fail_task(cls, task_id: int) -> dict[str, Any]:
+        """将异常退出的采集任务置为停止，避免永久显示为运行中。"""
+        async with _Session() as s, s.begin():
+            task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            task.status = 2
+            task.end_time = _now()
         return _model_to_dict(task)
 
     @classmethod
@@ -290,30 +330,36 @@ class TaskCollection:
     @classmethod
     async def change_task_name(cls, task_id: int, new_name: str) -> dict[str, Any]:
         async with _Session() as s, s.begin():
-            await s.execute(
-                update(TaskModel)
-                .where(TaskModel.id == task_id)
-                .values(name=new_name)
-            )
             task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            task.name = new_name
         return _model_to_dict(task)
 
     @classmethod
     async def set_task_version(cls, task_id: int, version: str) -> dict[str, Any]:
         async with _Session() as s, s.begin():
-            await s.execute(
-                update(TaskModel)
-                .where(TaskModel.id == task_id)
-                .values(version=version)
-            )
             task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            task.version = version
         return _model_to_dict(task)
 
     @classmethod
     async def set_task_baseline(cls, task_id: int, is_baseline: bool = True) -> dict[str, Any]:
         async with _Session() as s, s.begin():
+            # 验证目标任务存在
+            task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+
             if is_baseline:
-                await s.execute(update(TaskModel).values(is_baseline=0))
+                # 仅取消其它已置位基线的任务，再置位目标任务（单一基线）
+                await s.execute(
+                    update(TaskModel)
+                    .where(TaskModel.is_baseline == 1, TaskModel.id != task_id)
+                    .values(is_baseline=0)
+                )
             await s.execute(
                 update(TaskModel)
                 .where(TaskModel.id == task_id)
@@ -331,12 +377,15 @@ class TaskCollection:
         return _model_to_dict(task) if task else None
 
     @classmethod
-    async def get_all_stop_task_monitor_pid(cls) -> list[int]:
-        async with _Session() as s:
-            rows = (await s.execute(
-                select(TaskModel.monitor_pid).where(TaskModel.status == 2)
-            )).scalars().all()
-        return [pid for pid in rows if pid]
+    async def recover_interrupted_tasks(cls) -> int:
+        """启动时收敛上次异常退出遗留的待启动/运行中任务，不操作历史 PID。"""
+        async with _Session() as s, s.begin():
+            result = await s.execute(
+                update(TaskModel)
+                .where(TaskModel.status.in_([0, 1]))
+                .values(status=2, end_time=_now(), monitor_pid=None)
+            )
+        return result.rowcount or 0
 
 
 # ══════════════════════════════════════════════════════════════
@@ -371,12 +420,13 @@ class ComparisonReportCollection:
         if not kwargs:
             return await cls.get_report(report_id)
         async with _Session() as s, s.begin():
-            await s.execute(
-                update(ComparisonReportModel)
-                .where(ComparisonReportModel.id == report_id)
-                .values(**kwargs)
-            )
             report = await s.get(ComparisonReportModel, report_id)
+            if not report:
+                raise RuntimeError(f"对比报告 {report_id} 不存在")
+            for key, value in kwargs.items():
+                if not hasattr(report, key):
+                    raise ValueError(f"不支持的报告字段: {key}")
+                setattr(report, key, value)
         return _model_to_dict(report)
 
     @classmethod
@@ -488,12 +538,15 @@ class LabelCollection:
         if not fields:
             return await cls.get_label(label_id)
         async with _Session() as s, s.begin():
-            await s.execute(
-                update(LabelModel)
-                .where(LabelModel.id == label_id)
-                .values(**fields)
-            )
             label = await s.get(LabelModel, label_id)
+            if not label:
+                raise RuntimeError(f"标签 {label_id} 不存在")
+            new_start = fields.get("start_ts", label.start_ts)
+            new_end = fields.get("end_ts", label.end_ts)
+            if new_start >= new_end:
+                raise ValueError("start_ts 必须小于 end_ts")
+            for key, value in fields.items():
+                setattr(label, key, value)
         return _model_to_dict(label)
 
     @classmethod

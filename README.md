@@ -119,8 +119,23 @@ A client performance collection and analysis tool supporting **PC / Android / iO
 
 ### 基础安装 / Basic Installation
 
+项目使用 [uv](https://docs.astral.sh/uv/) 管理环境、依赖和构建：
+The project uses [uv](https://docs.astral.sh/uv/) for environments, dependencies, and builds:
+
 ```bash
-pip install client-perf
+# 从源码创建 .venv、安装依赖并以 editable 模式安装当前项目
+# Create .venv, install dependencies, and install this project in editable mode
+uv sync
+
+# 运行命令 / Run commands
+uv run client-perf --help
+```
+
+从软件源安装发布版本时可使用：
+To install a released version from the package index:
+
+```bash
+uv tool install client-perf
 ```
 
 ### 平台依赖 / Platform Dependencies
@@ -162,11 +177,15 @@ Depending on the test platform, additional tools may need to be installed:
 ### 启动服务 / Start Service
 
 ```bash
-# 默认监听 0.0.0.0:8080 / Default listen on 0.0.0.0:8080
+# 默认仅监听本机 127.0.0.1:8080 / Listens on local host 127.0.0.1:8080 by default
 python -m client_perf
 
 # 指定监听地址 / Specify listen address
 python -m client_perf --host 127.0.0.1 --port 8080
+
+# 如需自定义数据库、采集结果和报告目录
+# Customize database, collection results, and report directory
+CLIENT_PERF_DATA_DIR=/path/to/data python -m client_perf
 ```
 
 ### 管理员权限说明 / Administrator Permission
@@ -329,10 +348,24 @@ adbutils>=2.8.0           # Android ADB 工具 / Android ADB tool
 psutil>=5.9.0             # PC 系统信息采集 / PC system info collection
 pynvml>=11.5.0            # NVIDIA GPU（可选）/ NVIDIA GPU (optional)
 openpyxl>=3.1.0           # Excel 导出 / Excel export
-apscheduler>=3.10.0       # 定时任务调度 / Task scheduling
 Pillow>=10.0.0            # PC 截图（可选）/ PC screenshot (optional)
-Cython>=0.29.0            # 用于编译 Python 代码 / For compiling Python code
 ```
+
+可选：原生加速（可选）/ Optional: native acceleration
+
+```bash
+uv sync --extra native             # 安装 mypy + setuptools（nativebuild 编译用）
+uv run nativebuild                 # 构建隔离原生产物
+uv run client-perf native-start    # 构建后按原启动流程运行
+```
+
+构建 wheel 和源码包使用 `uv build`；依赖与项目元数据统一维护在 `pyproject.toml`。
+安装后执行独立命令 `nativebuild`，即可在本地把模块编译为 C 扩展并隔离部署。
+`client-perf native-start <原启动参数>` 等价于先执行 `nativebuild`，再按原参数启动
+`client-perf <原启动参数>`；例如 `client-perf native-start --port 9090`。
+After installing, run the standalone `nativebuild` command to compile modules into isolated
+C extensions. `client-perf native-start <original args>` builds first and then follows the
+same startup path as `client-perf <original args>`.
 
 ### 外部工具 / External Tools
 

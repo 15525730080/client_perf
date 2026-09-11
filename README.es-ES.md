@@ -117,8 +117,20 @@ Herramienta de recolección y análisis de rendimiento del cliente, compatible c
 
 ### Instalación Básica / Basic Installation
 
+El proyecto usa [uv](https://docs.astral.sh/uv/) para gestionar el entorno, las dependencias y la construcción:
+
 ```bash
-pip install client-perf
+# Crear .venv, instalar dependencias e instalar el proyecto en modo editable
+uv sync
+
+# Ejecutar comandos del proyecto
+uv run client-perf --help
+```
+
+Para instalar una versión publicada desde el índice de paquetes:
+
+```bash
+uv tool install client-perf
 ```
 
 ### Dependencias de Plataforma / Platform Dependencies
@@ -317,9 +329,8 @@ adbutils>=2.8.0           # Herramienta Android ADB
 psutil>=5.9.0             # Recolección de info del sistema PC
 pynvml>=11.5.0            # GPU NVIDIA (opcional)
 openpyxl>=3.1.0           # Exportación de Excel
-apscheduler>=3.10.0       # Programación de tareas
 Pillow>=10.0.0            # Captura de pantalla PC (opcional)
-Cython>=0.29.0            # Para compilar código Python
+mypy>=1.14                # Compilación nativa mypyc (incluida en mypy)
 ```
 
 ### Herramientas Externas / External Tools
