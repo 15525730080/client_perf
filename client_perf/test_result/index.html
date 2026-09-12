@@ -985,7 +985,7 @@
                 <div class="chart-body" style="height:320px;padding:0;">
                     <div class="screenshot-panel" style="height:100%;border-radius:0;">
                         <img v-if="clicktime"
-                            :src="'/static/' + opentaskid + '/screenshot/' + clicktime + '.png'"
+                            :src="'/task_screenshot/?task_id=' + opentaskid + '&timestamp=' + clicktime"
                             alt="截图" style="max-height:100%;max-width:100%;object-fit:contain;" />
                         <div v-else class="screenshot-placeholder">点击图表时间轴<br>查看对应截图</div>
                     </div>
