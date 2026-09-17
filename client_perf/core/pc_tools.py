@@ -48,6 +48,7 @@ class WinFps(object):
     single_instance = None
     fps_process = None
     _admin_warned = False
+    _start_lock = threading.Lock()
 
     def __init__(self, pid):
         self.pid = pid
@@ -58,8 +59,14 @@ class WinFps(object):
         return cls.single_instance
 
     def fps(self):
-        if not WinFps.fps_process:
-            threading.Thread(target=self.start_fps_collect, args=(self.pid,)).start()
+        if WinFps.fps_process is None:
+            with WinFps._start_lock:
+                if WinFps.fps_process is None:
+                    threading.Thread(
+                        target=self.start_fps_collect,
+                        args=(self.pid,),
+                        daemon=True,
+                    ).start()
         if self.check_queue_head_frames_complete():
             return self.pop_complete_fps()
 
@@ -93,37 +100,57 @@ class WinFps(object):
                     "请以管理员身份运行 client-perf，或启动时不要使用 --no-elevate 参数。"
                 )
             return
-        print("start fps ")
+
         start_fps_collect_time = int(time.time())
-        PresentMon = Path(__file__).parent.parent.joinpath("tool", f"PresentMon-1.8.0-{'x64' if platform.machine() == 'AMD64' else 'x86'}.exe")
+        PresentMon = Path(__file__).parent.parent.joinpath(
+            "tool",
+            f"PresentMon-1.8.0-{'x64' if platform.machine() == 'AMD64' else 'x86'}.exe",
+        )
         if not PresentMon.exists():
             logger.error(f"PresentMon.exe 不存在: {PresentMon}")
             return
+
+        process = None
         try:
-            res_terminate = subprocess.Popen(
-                [str(PresentMon), "-process_id", str(pid), "-output_stdout", "-stop_existing_session"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            print(res_terminate)
-        except Exception as e:
-            logger.error(f"PresentMon 启动失败: {e}")
-            return
-        WinFps.fps_process = res_terminate
-        res_terminate.stdout.readline()
-        while not res_terminate.poll():
-            line = res_terminate.stdout.readline()
-            if not line:
+            process = subprocess.Popen(
+                [
+                    str(PresentMon),
+                    "-process_id",
+                    str(pid),
+                    "-output_stdout",
+                    "-stop_existing_session",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            WinFps.fps_process = process
+            if process.stdout is not None:
+                process.stdout.readline()
+            while process.poll() is None:
+                if process.stdout is None:
+                    break
+                line = process.stdout.readline()
+                if not line:
+                    break
                 try:
-                    res_terminate.kill()
-                except Exception as e:
-                    logger.error(e)
-                break
-            try:
-                line = line.decode(encoding="utf-8")
-                line_list = line.split(",")
-                WinFps.frame_que.append(start_fps_collect_time + round(float(line_list[7]), 7))
-            except Exception:
-                time.sleep(1)
-                logger.error(traceback.format_exc())
+                    line = line.decode("utf-8")
+                    line_list = line.split(",")
+                    WinFps.frame_que.append(
+                        start_fps_collect_time + round(float(line_list[7]), 7)
+                    )
+                except Exception:
+                    logger.error(traceback.format_exc())
+        except Exception:
+            logger.error(traceback.format_exc())
+        finally:
+            current = WinFps.fps_process
+            if current is not None:
+                try:
+                    if current.poll() is None:
+                        current.kill()
+                except Exception:
+                    pass
+            WinFps.fps_process = None
 
 
 async def sys_info():
@@ -396,10 +423,15 @@ async def gpu(pid, include_child=False):
             for i in range(device_count):
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                 processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                for proc in processes:
-                    if proc.pid in pids:
-                        gpu_Utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                        gpu_utilization_percentage = gpu_Utilization.gpu  # GPU的计算使用率
+                if not any(proc.pid in pids for proc in processes):
+                    continue
+                utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                current_gpu = utilization.gpu
+                if (
+                    gpu_utilization_percentage is None
+                    or current_gpu > gpu_utilization_percentage
+                ):
+                    gpu_utilization_percentage = current_gpu
             return {"gpu": gpu_utilization_percentage, "time": start_time}
         except Exception as e:
             logger.error(f"获取GPU数据失败: {str(e)}")

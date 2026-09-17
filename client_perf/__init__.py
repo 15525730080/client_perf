@@ -19,4 +19,4 @@ if _native_root:
             sys.path.insert(0, str(_native_root_path))
         __path__.insert(0, str(_native_package))
 
-__version__ = "5.1.0"
+__version__ = "5.1.1"

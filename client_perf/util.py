@@ -77,33 +77,38 @@ class DataCollect:
             values.sort(key=lambda x: x["time"])
             data["value"] = values
 
-            # 统计（只统计有完整字段的行）
+            # 统计：只要某字段在任一采样行中出现数值，就纳入统计；
+            # 不能依赖首条记录是否为 None 来决定字段存在性。
             full_rows = [v for v in values if len(v) > 1]
             if not full_rows:
                 data["max_value"] = {}
                 data["avg_value"] = {}
                 continue
 
-            numeric_keys = [
-                k for k in full_rows[0]
-                if k != "time" and isinstance(full_rows[0][k], (int, float))
-            ]
+            numeric_keys: set[str] = set()
+            for row in full_rows:
+                for key, value in row.items():
+                    if key == "time":
+                        continue
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        numeric_keys.add(key)
+
             max_val: dict[str, float] = {}
             sum_val: dict[str, float] = {k: 0.0 for k in numeric_keys}
-            cnt_val: dict[str, int]   = {k: 0   for k in numeric_keys}
+            cnt_val: dict[str, int] = {k: 0 for k in numeric_keys}
 
             for row in full_rows:
-                for k in numeric_keys:
-                    v = row.get(k)
-                    if v is not None and isinstance(v, (int, float)):
-                        max_val[k] = max(max_val.get(k, v), v)
-                        sum_val[k] += v
-                        cnt_val[k] += 1
+                for key in numeric_keys:
+                    value = row.get(key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        max_val[key] = max(max_val.get(key, value), value)
+                        sum_val[key] += value
+                        cnt_val[key] += 1
 
-            data["max_value"] = {k: round(max_val[k], 4) for k in numeric_keys if k in max_val}
+            data["max_value"] = {key: round(max_val[key], 4) for key in numeric_keys if key in max_val}
             data["avg_value"] = {
-                k: round(sum_val[k] / cnt_val[k], 4)
-                for k in numeric_keys if cnt_val[k] > 0
+                key: round(sum_val[key] / cnt_val[key], 4)
+                for key in numeric_keys if cnt_val[key] > 0
             }
 
         return all_data

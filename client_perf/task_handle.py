@@ -65,7 +65,11 @@ class TaskHandle(Process):
                 self._run_pc()
         except Exception:
             logger.error(traceback.format_exc())
-        finally:
+            try:
+                asyncio.run(TaskCollection.fail_task(self.task_id))
+            except Exception:
+                logger.error("更新失败任务状态失败:\n%s", traceback.format_exc())
+        else:
             try:
                 asyncio.run(TaskCollection.stop_task(self.task_id))
             except Exception:

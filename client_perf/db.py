@@ -192,6 +192,12 @@ def _model_to_dict(obj: Any) -> dict[str, Any]:
     }
 
 
+TASK_CREATED = 0
+TASK_RUNNING = 1
+TASK_STOPPED = 2
+TASK_FAILED = 3
+
+
 # ══════════════════════════════════════════════════════════════
 #  TaskCollection
 # ══════════════════════════════════════════════════════════════
@@ -249,7 +255,7 @@ class TaskCollection:
             task = TaskModel(
                 start_time=_now(),
                 serialno=serialno,
-                status=0,
+                status=TASK_CREATED,
                 target_pid=pid,
                 target_pid_name=pid_name or "",
                 platform=task_platform,
@@ -273,9 +279,18 @@ class TaskCollection:
             await s.execute(
                 update(TaskModel)
                 .where(TaskModel.id == task_id)
-                .values(status=1, monitor_pid=monitor_pid)
+                .values(status=TASK_RUNNING, monitor_pid=monitor_pid)
             )
             task = await s.get(TaskModel, task_id)
+        return _model_to_dict(task)
+
+    @classmethod
+    async def mark_task_starting(cls, task_id: int) -> dict[str, Any]:
+        async with _Session() as s, s.begin():
+            task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            task.status = TASK_RUNNING
         return _model_to_dict(task)
 
     @classmethod
@@ -284,18 +299,18 @@ class TaskCollection:
             task = await s.get(TaskModel, task_id)
             if not task:
                 raise RuntimeError(f"任务 {task_id} 不存在")
-            task.status = 2
+            task.status = TASK_STOPPED
             task.end_time = _now()
         return _model_to_dict(task)
 
     @classmethod
     async def fail_task(cls, task_id: int) -> dict[str, Any]:
-        """将异常退出的采集任务置为停止，避免永久显示为运行中。"""
+        """将异常退出的采集任务标记为失败，避免误判为正常结束。"""
         async with _Session() as s, s.begin():
             task = await s.get(TaskModel, task_id)
             if not task:
                 raise RuntimeError(f"任务 {task_id} 不存在")
-            task.status = 2
+            task.status = TASK_FAILED
             task.end_time = _now()
         return _model_to_dict(task)
 

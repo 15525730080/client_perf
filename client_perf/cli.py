@@ -43,11 +43,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("capabilities", help="查看各平台采集能力")
 
     system_info = subparsers.add_parser("system-info", help="查看设备系统信息")
-    system_info.add_argument("--device-type", default="pc", choices=("pc", "android", "ios", "harmony"))
+    system_info.add_argument(
+        "--device-type",
+        default="pc",
+        choices=("pc", "android", "ios", "ios_simulator", "harmony"),
+    )
     system_info.add_argument("--device-id", default="", help="设备 ID/UDID")
 
     apps = subparsers.add_parser("apps", help="列出设备应用")
-    apps.add_argument("--device-type", required=True, choices=("android", "ios", "harmony"))
+    apps.add_argument(
+        "--device-type",
+        required=True,
+        choices=("android", "ios", "ios_simulator", "harmony"),
+    )
     apps.add_argument("--device-id", required=True, help="设备 ID/UDID")
 
     subparsers.add_parser("tasks", help="列出采集任务")
