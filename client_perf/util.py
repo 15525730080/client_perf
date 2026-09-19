@@ -77,8 +77,7 @@ class DataCollect:
             values.sort(key=lambda x: x["time"])
             data["value"] = values
 
-            # 统计：只要某字段在任一采样行中出现数值，就纳入统计；
-            # 不能依赖首条记录是否为 None 来决定字段存在性。
+            # 统计（只统计有完整字段的行）
             full_rows = [v for v in values if len(v) > 1]
             if not full_rows:
                 data["max_value"] = {}
@@ -94,8 +93,8 @@ class DataCollect:
                         numeric_keys.add(key)
 
             max_val: dict[str, float] = {}
-            sum_val: dict[str, float] = {k: 0.0 for k in numeric_keys}
-            cnt_val: dict[str, int] = {k: 0 for k in numeric_keys}
+            sum_val: dict[str, float] = {key: 0.0 for key in numeric_keys}
+            cnt_val: dict[str, int] = {key: 0 for key in numeric_keys}
 
             for row in full_rows:
                 for key in numeric_keys:
@@ -105,10 +104,15 @@ class DataCollect:
                         sum_val[key] += value
                         cnt_val[key] += 1
 
-            data["max_value"] = {key: round(max_val[key], 4) for key in numeric_keys if key in max_val}
+            data["max_value"] = {
+                key: round(max_val[key], 4)
+                for key in numeric_keys
+                if key in max_val
+            }
             data["avg_value"] = {
                 key: round(sum_val[key] / cnt_val[key], 4)
-                for key in numeric_keys if cnt_val[key] > 0
+                for key in numeric_keys
+                if cnt_val[key] > 0
             }
 
         return all_data
