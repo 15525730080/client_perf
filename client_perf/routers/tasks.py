@@ -72,6 +72,7 @@ async def run_task(
             package_name=package_name,
         )
         await TaskCollection.mark_task_starting(task_id)
+
         handle = TaskHandle(
             serialno=device_id or platform.node(),
             file_dir=file_dir,
@@ -83,11 +84,7 @@ async def run_task(
             device_id=device_id,
             package_name=package_name,
         )
-        try:
-            handle.start()
-        except Exception as exc:
-            await TaskCollection.fail_task(task_id)
-            raise RuntimeError(str(exc)) from exc
+        handle.start()
         return ok()
     except Exception as exc:
         if "task_id" in locals():
