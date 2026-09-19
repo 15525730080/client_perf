@@ -49,6 +49,7 @@ class WinFps(object):
     fps_process = None
     _admin_warned = False
     _start_lock = threading.Lock()
+    _start_pending = False
 
     def __init__(self, pid):
         self.pid = pid
@@ -59,9 +60,10 @@ class WinFps(object):
         return cls.single_instance
 
     def fps(self):
-        if WinFps.fps_process is None:
+        if WinFps.fps_process is None and not WinFps._start_pending:
             with WinFps._start_lock:
-                if WinFps.fps_process is None:
+                if WinFps.fps_process is None and not WinFps._start_pending:
+                    WinFps._start_pending = True
                     threading.Thread(
                         target=self.start_fps_collect,
                         args=(self.pid,),
@@ -89,32 +91,32 @@ class WinFps(object):
         return complete_fps
 
     def start_fps_collect(self, pid):
-        if platform.system() != "Windows":
-            return
-
-        if not _is_admin():
-            if not WinFps._admin_warned:
-                WinFps._admin_warned = True
-                logger.error(
-                    "PresentMon 需要管理员权限才能采集 FPS。"
-                    "请以管理员身份运行 client-perf，或启动时不要使用 --no-elevate 参数。"
-                )
-            return
-
-        start_fps_collect_time = int(time.time())
-        PresentMon = Path(__file__).parent.parent.joinpath(
-            "tool",
-            f"PresentMon-1.8.0-{'x64' if platform.machine() == 'AMD64' else 'x86'}.exe",
-        )
-        if not PresentMon.exists():
-            logger.error(f"PresentMon.exe 不存在: {PresentMon}")
-            return
-
         process = None
         try:
+            if platform.system() != "Windows":
+                return
+
+            if not _is_admin():
+                if not WinFps._admin_warned:
+                    WinFps._admin_warned = True
+                    logger.error(
+                        "PresentMon 需要管理员权限才能采集 FPS。"
+                        "请以管理员身份运行 client-perf，或启动时不要使用 --no-elevate 参数。"
+                    )
+                return
+
+            start_fps_collect_time = int(time.time())
+            present_mon = Path(__file__).parent.parent.joinpath(
+                "tool",
+                f"PresentMon-1.8.0-{'x64' if platform.machine() == 'AMD64' else 'x86'}.exe",
+            )
+            if not present_mon.exists():
+                logger.error(f"PresentMon.exe 不存在: {present_mon}")
+                return
+
             process = subprocess.Popen(
                 [
-                    str(PresentMon),
+                    str(present_mon),
                     "-process_id",
                     str(pid),
                     "-output_stdout",
@@ -124,17 +126,16 @@ class WinFps(object):
                 stderr=subprocess.PIPE,
             )
             WinFps.fps_process = process
-            if process.stdout is not None:
-                process.stdout.readline()
+
+            if process.stdout is None:
+                return
+            process.stdout.readline()
             while process.poll() is None:
-                if process.stdout is None:
-                    break
                 line = process.stdout.readline()
                 if not line:
                     break
                 try:
-                    line = line.decode("utf-8")
-                    line_list = line.split(",")
+                    line_list = line.decode("utf-8").split(",")
                     WinFps.frame_que.append(
                         start_fps_collect_time + round(float(line_list[7]), 7)
                     )
@@ -143,14 +144,16 @@ class WinFps(object):
         except Exception:
             logger.error(traceback.format_exc())
         finally:
-            current = WinFps.fps_process
-            if current is not None:
+            if process is not None:
                 try:
-                    if current.poll() is None:
-                        current.kill()
+                    if process.poll() is None:
+                        process.kill()
                 except Exception:
                     pass
-            WinFps.fps_process = None
+            with WinFps._start_lock:
+                if WinFps.fps_process is process:
+                    WinFps.fps_process = None
+                WinFps._start_pending = False
 
 
 async def sys_info():
@@ -423,15 +426,14 @@ async def gpu(pid, include_child=False):
             for i in range(device_count):
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                 processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-                if not any(proc.pid in pids for proc in processes):
-                    continue
-                utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                current_gpu = utilization.gpu
-                if (
-                    gpu_utilization_percentage is None
-                    or current_gpu > gpu_utilization_percentage
-                ):
-                    gpu_utilization_percentage = current_gpu
+                if any(proc.pid in pids for proc in processes):
+                    utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                    current_gpu = utilization.gpu
+                    if (
+                        gpu_utilization_percentage is None
+                        or current_gpu > gpu_utilization_percentage
+                    ):
+                        gpu_utilization_percentage = current_gpu
             return {"gpu": gpu_utilization_percentage, "time": start_time}
         except Exception as e:
             logger.error(f"获取GPU数据失败: {str(e)}")
