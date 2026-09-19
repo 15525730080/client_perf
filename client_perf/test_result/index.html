@@ -183,6 +183,7 @@
         }
         .status-running { background: #fff7e6; color: #d46b08; }
         .status-done    { background: #f6ffed; color: #389e0d; }
+        .status-failed  { background: #fff1f0; color: #cf1322; }
         .status-idle    { background: #f5f5f5; color: #8c8c8c; }
         .status-dot-sm  { width: 6px; height: 6px; border-radius: 50%; }
         .status-running .status-dot-sm { background: #fa8c16; animation: pulse 1.2s infinite; }
@@ -488,6 +489,9 @@
                                         <span v-else-if="row.status==2" class="status-tag status-done">
                                             <span class="status-dot-sm"></span> 已完成
                                         </span>
+                                        <span v-else-if="row.status==3" class="status-tag status-failed">
+                                            <span class="status-dot-sm"></span> 失败
+                                        </span>
                                         <span v-else class="status-tag status-idle">
                                             <span class="status-dot-sm"></span> 未开始
                                         </span>
@@ -789,6 +793,7 @@
                                         <td>
                                             <span v-if="row.status==2" class="status-tag status-done"><span class="status-dot-sm"></span>已完成</span>
                                             <span v-else-if="row.status==1" class="status-tag status-running"><span class="status-dot-sm"></span>采集中</span>
+                                            <span v-else-if="row.status==3" class="status-tag status-failed"><span class="status-dot-sm"></span>失败</span>
                                             <span v-else class="status-tag status-idle"><span class="status-dot-sm"></span>未开始</span>
                                         </td>
                                     </tr>
