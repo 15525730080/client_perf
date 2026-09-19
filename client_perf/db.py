@@ -31,6 +31,11 @@ from sqlalchemy.orm import DeclarativeBase
 from client_perf.log import log as logger
 from client_perf.paths import PROJECT_ROOT as _PATH_PROJECT_ROOT, get_db_path
 
+TASK_CREATED = 0
+TASK_RUNNING = 1
+TASK_STOPPED = 2
+TASK_FAILED = 3
+
 # ── 数据库路径 ────────────────────────────────────────────────
 # 保留 _PROJECT_ROOT 以兼容既有测试和旧数据库查找逻辑。
 _PROJECT_ROOT = str(_PATH_PROJECT_ROOT)
@@ -192,12 +197,6 @@ def _model_to_dict(obj: Any) -> dict[str, Any]:
     }
 
 
-TASK_CREATED = 0
-TASK_RUNNING = 1
-TASK_STOPPED = 2
-TASK_FAILED = 3
-
-
 # ══════════════════════════════════════════════════════════════
 #  TaskCollection
 # ══════════════════════════════════════════════════════════════
@@ -223,7 +222,7 @@ class TaskCollection:
                 dup = (await s.execute(
                     select(TaskModel)
                     .where(TaskModel.target_pid == pid,
-                           TaskModel.status.in_([0, 1]))
+                           TaskModel.status.in_([TASK_CREATED, TASK_RUNNING]))
                 )).scalar_one_or_none()
             else:
                 dup = (await s.execute(
@@ -231,7 +230,7 @@ class TaskCollection:
                     .where(TaskModel.device_type == device_type,
                            TaskModel.device_id == device_id,
                            TaskModel.package_name == package_name,
-                           TaskModel.status.in_([0, 1]))
+                           TaskModel.status.in_([TASK_CREATED, TASK_RUNNING]))
                 )).scalar_one_or_none()
 
             if dup:
@@ -274,23 +273,24 @@ class TaskCollection:
         return task.id, file_dir
 
     @classmethod
-    async def set_task_running(cls, task_id: int, monitor_pid: int) -> dict[str, Any]:
-        async with _Session() as s, s.begin():
-            await s.execute(
-                update(TaskModel)
-                .where(TaskModel.id == task_id)
-                .values(status=TASK_RUNNING, monitor_pid=monitor_pid)
-            )
-            task = await s.get(TaskModel, task_id)
-        return _model_to_dict(task)
-
-    @classmethod
     async def mark_task_starting(cls, task_id: int) -> dict[str, Any]:
         async with _Session() as s, s.begin():
             task = await s.get(TaskModel, task_id)
             if not task:
                 raise RuntimeError(f"任务 {task_id} 不存在")
             task.status = TASK_RUNNING
+        return _model_to_dict(task)
+
+    @classmethod
+    async def set_task_running(cls, task_id: int, monitor_pid: int) -> dict[str, Any]:
+        async with _Session() as s, s.begin():
+            task = await s.get(TaskModel, task_id)
+            if not task:
+                raise RuntimeError(f"任务 {task_id} 不存在")
+            # 父进程已将任务置为 RUNNING；若用户在子进程启动前停止任务，
+            # 不得把 STOPPED/FAILED 状态重新覆盖为 RUNNING。
+            if task.status == TASK_RUNNING:
+                task.monitor_pid = monitor_pid
         return _model_to_dict(task)
 
     @classmethod
@@ -305,7 +305,7 @@ class TaskCollection:
 
     @classmethod
     async def fail_task(cls, task_id: int) -> dict[str, Any]:
-        """将异常退出的采集任务标记为失败，避免误判为正常结束。"""
+        """将异常退出或启动失败的采集任务标记为失败。"""
         async with _Session() as s, s.begin():
             task = await s.get(TaskModel, task_id)
             if not task:
@@ -336,7 +336,7 @@ class TaskCollection:
             task = await s.get(TaskModel, task_id)
             if not task:
                 raise RuntimeError(f"任务 {task_id} 不存在")
-            if task.status == 1:
+            if task.status == TASK_RUNNING:
                 raise RuntimeError("任务运行中，不能删除")
             result = _model_to_dict(task)
             await s.delete(task)
@@ -397,8 +397,8 @@ class TaskCollection:
         async with _Session() as s, s.begin():
             result = await s.execute(
                 update(TaskModel)
-                .where(TaskModel.status.in_([0, 1]))
-                .values(status=2, end_time=_now(), monitor_pid=None)
+                .where(TaskModel.status.in_([TASK_CREATED, TASK_RUNNING]))
+                .values(status=TASK_FAILED, end_time=_now(), monitor_pid=None)
             )
         return result.rowcount or 0
 
