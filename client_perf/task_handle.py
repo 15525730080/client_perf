@@ -50,9 +50,14 @@ class TaskHandle(Process):
             f"device_type={self.device_type} device_id={self.device_id} "
             f"package={self.package_name}"
         )
-        asyncio.run(TaskCollection.set_task_running(self.task_id, self.pid))
-
         try:
+            task = asyncio.run(TaskCollection.set_task_running(self.task_id, self.pid))
+            if task.get("status") != 1:
+                logger.info(
+                    f"[TaskHandle] task_id={self.task_id} 已取消，跳过采集启动"
+                )
+                return
+
             if self.device_type == "android":
                 self._run_android()
             elif self.device_type == "ios":
